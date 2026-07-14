@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RAG-Audit · Monitoramento de acessos</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}">
+  <script src="{{ url_for('static', path='/dashboard.js') }}" defer></script>
+</head>
+<body
+  data-timezone="{{ timezone }}"
+  data-environment="{{ environment }}"
+  data-admin="{{ admin }}"
+>
+  <a class="skip-link" href="#main-content">Ir para o conteúdo principal</a>
+
+  <header class="app-header">
+    <div class="app-header__inner">
+      <div class="brand" aria-label="RAG-Audit">
+        <span class="brand__mark" aria-hidden="true">RA</span>
+        <span>
+          <strong class="brand__name">RAG-Audit</strong>
+          <small class="brand__descriptor">Salas críticas</small>
+        </span>
+      </div>
+
+      <div class="header-status">
+        <span class="environment-badge">{{ environment }}</span>
+        <span id="liveStatus" class="connection-status connection-status--connecting" role="status">
+          <span class="connection-status__dot" aria-hidden="true"></span>
+          <span id="liveStatusText">Conectando…</span>
+        </span>
+        <button id="liveToggle" class="button button--header" type="button" aria-pressed="false">
+          Pausar atualização
+        </button>
+        <span class="admin-chip" title="Usuário autenticado">
+          <span aria-hidden="true">●</span>
+          {{ admin }}
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <main id="main-content" class="page-shell">
+    <section class="page-heading" aria-labelledby="page-title">
+      <div>
+        <p class="eyebrow">Auditoria contextual em tempo real</p>
+        <h1 id="page-title">Visão de acessos</h1>
+        <p class="page-heading__description">
+          Acompanhe quem entrou, o contexto encontrado e o risco calculado para cada evento.
+        </p>
+      </div>
+      <div class="last-update" aria-live="polite">
+        <span>Dados atualizados</span>
+        <strong id="lastUpdated">aguardando…</strong>
+        <small>Fuso: {{ timezone }}</small>
+      </div>
+    </section>
+
+    {% if demo_mode %}
+    <aside class="demo-banner" role="status" aria-label="Ambiente de demonstração">
+      <span class="demo-banner__icon" aria-hidden="true">i</span>
+      <div>
+        <strong>Dados de demonstração</strong>
+        <p>Os eventos exibidos são simulados. A câmera Intelbras e a base facial ainda não estão conectadas.</p>
+      </div>
+    </aside>
+    {% endif %}
+
+    <div id="globalNotice" class="notice" role="alert" hidden>
+      <span id="globalNoticeText"></span>
+      <button id="globalNoticeClose" type="button" aria-label="Fechar aviso">×</button>
+    </div>
+
+    <section class="panel filters-panel" aria-labelledby="filters-title">
+      <div class="panel__heading panel__heading--filters">
+        <div>
+          <p class="section-kicker">Escopo da consulta</p>
+          <h2 id="filters-title">Filtros</h2>
+        </div>
+        <div class="quick-ranges" aria-label="Períodos rápidos">
+          <button class="quick-range is-active" type="button" data-range="today" aria-pressed="true">Hoje</button>
+          <button class="quick-range" type="button" data-range="24h" aria-pressed="false">24 horas</button>
+          <button class="quick-range" type="button" data-range="7d" aria-pressed="false">7 dias</button>
+        </div>
+      </div>
+
+      <form id="filtersForm" class="filters-form" novalidate>
+        <label class="field">
+          <span>De</span>
+          <input id="filterFrom" name="from" type="datetime-local" step="60">
+        </label>
+
+        <label class="field">
+          <span>Até</span>
+          <input id="filterTo" name="to" type="datetime-local" step="60">
+        </label>
+
+        <label class="field">
+          <span>Sala</span>
+          <select id="filterRoom" name="room_id">
+            <option value="">Todas as salas</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Pessoa ou ID</span>
+          <input id="filterPerson" name="user_id" type="search" maxlength="100" placeholder="Ex.: EMP002">
+        </label>
+
+        <label class="field">
+          <span>Classificação</span>
+          <select id="filterDecision" name="decision">
+            <option value="">Todas</option>
+            <option value="AUTHORIZED">Padrão</option>
+            <option value="JUSTIFIED">Justificado</option>
+            <option value="ANOMALY">Anomalia</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Nível de risco</span>
+          <select id="filterRisk" name="risk_level">
+            <option value="">Todos</option>
+            <option value="LOW">Baixo</option>
+            <option value="MEDIUM">Médio</option>
+            <option value="HIGH">Alto</option>
+            <option value="CRITICAL">Crítico</option>
+          </select>
+        </label>
+
+        <label class="field">
+          <span>Status do alerta</span>
+          <select id="filterAlert" name="alert_status">
+            <option value="">Todos</option>
+            <option value="NONE">Sem alerta</option>
+            <option value="PENDING">Pendente</option>
+            <option value="RETRYING">Reenviando</option>
+            <option value="SENT">Enviado</option>
+            <option value="FAILED">Falhou</option>
+          </select>
+        </label>
+
+        <label class="field field--wide">
+          <span>Buscar nos registros</span>
+          <input id="filterQuery" name="q" type="search" maxlength="100" placeholder="Evento, nome, cargo ou trecho do relatório">
+        </label>
+
+        <div class="filter-actions">
+          <button class="button button--primary" type="submit">Aplicar filtros</button>
+          <button id="clearFilters" class="button button--secondary" type="button">Limpar</button>
+          <button id="exportReport" class="button button--report" type="button">
+            <span aria-hidden="true">↓</span>
+            Gerar PDF
+          </button>
+        </div>
+      </form>
+      <p id="filterError" class="form-error" role="alert" hidden></p>
+    </section>
+
+    <section class="metrics-section" aria-labelledby="metrics-title">
+      <div class="section-heading">
+        <div>
+          <p class="section-kicker">Resumo do período</p>
+          <h2 id="metrics-title">Indicadores</h2>
+        </div>
+        <span id="metricsScope" class="scope-label">Hoje</span>
+      </div>
+
+      <div id="metricsGrid" class="metrics-grid" aria-busy="true">
+        <article class="metric-card metric-card--total">
+          <span class="metric-card__icon" aria-hidden="true">Σ</span>
+          <div>
+            <span class="metric-card__label">Entradas analisadas</span>
+            <strong id="metricTotal" class="metric-card__value">—</strong>
+            <small>no período filtrado</small>
+          </div>
+        </article>
+
+        <article class="metric-card metric-card--success">
+          <span class="metric-card__icon" aria-hidden="true">✓</span>
+          <div>
+            <span class="metric-card__label">Acessos padrão</span>
+            <strong id="metricAuthorized" class="metric-card__value">—</strong>
+            <small id="metricAuthorizedShare">baixo risco</small>
+          </div>
+        </article>
+
+        <article class="metric-card metric-card--warning">
+          <span class="metric-card__icon" aria-hidden="true">i</span>
+          <div>
+            <span class="metric-card__label">Justificados</span>
+            <strong id="metricJustified" class="metric-card__value">—</strong>
+            <small>contexto excepcional</small>
+          </div>
+        </article>
+
+        <article class="metric-card metric-card--danger">
+          <span class="metric-card__icon" aria-hidden="true">!</span>
+          <div>
+            <span class="metric-card__label">Anomalias</span>
+            <strong id="metricAnomalies" class="metric-card__value">—</strong>
+            <small>exigem revisão humana</small>
+          </div>
+        </article>
+
+        <article class="metric-card metric-card--alerts">
+          <span class="metric-card__icon" aria-hidden="true">↗</span>
+          <div>
+            <span class="metric-card__label">Alertas enviados</span>
+            <strong id="metricAlerts" class="metric-card__value">—</strong>
+            <small id="metricAlertFailures">0 falhas ou reenvios</small>
+          </div>
+        </article>
+
+        <article class="metric-card metric-card--sla">
+          <span class="metric-card__icon" aria-hidden="true">⏱</span>
+          <div>
+            <span class="metric-card__label">SLA interno da API &lt; 3 s</span>
+            <strong id="metricSla" class="metric-card__value">—</strong>
+            <small id="metricP95">p95: —</small>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel events-panel" aria-labelledby="events-title">
+      <div class="panel__heading events-heading">
+        <div>
+          <p class="section-kicker">Trilha de auditoria</p>
+          <h2 id="events-title">Eventos de acesso</h2>
+        </div>
+        <div class="events-actions">
+          <label class="compact-field" for="pageSize">
+            Exibir
+            <select id="pageSize">
+              <option value="25">25</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </label>
+          <button id="refreshEvents" class="button button--secondary button--compact" type="button">↻ Atualizar</button>
+        </div>
+      </div>
+
+      <button id="newEventsBanner" class="new-events-banner" type="button" hidden>
+        <span class="new-events-banner__dot" aria-hidden="true"></span>
+        <span id="newEventsText">Há novos eventos</span>
+        <strong>Exibir agora</strong>
+      </button>
+
+      <div id="eventsTableRegion" class="table-region" aria-live="polite" aria-busy="true">
+        <div class="table-scroll">
+          <table class="events-table">
+            <caption class="sr-only">Eventos de acesso conforme os filtros selecionados</caption>
+            <thead>
+              <tr>
+                <th scope="col">Data e hora</th>
+                <th scope="col">Pessoa</th>
+                <th scope="col">Sala</th>
+                <th scope="col">Classificação</th>
+                <th scope="col">Risco</th>
+                <th scope="col">Contexto</th>
+                <th scope="col">Alerta</th>
+                <th scope="col">Tempo</th>
+                <th scope="col"><span class="sr-only">Ações</span></th>
+              </tr>
+            </thead>
+            <tbody id="eventsBody"></tbody>
+          </table>
+        </div>
+
+        <div id="eventsLoading" class="table-state">
+          <span class="spinner" aria-hidden="true"></span>
+          <p>Carregando eventos…</p>
+        </div>
+
+        <div id="eventsEmpty" class="table-state" hidden>
+          <span class="table-state__symbol" aria-hidden="true">○</span>
+          <h3>Nenhum evento encontrado</h3>
+          <p>Tente ampliar o período ou remover algum filtro.</p>
+        </div>
+
+        <div id="eventsError" class="table-state table-state--error" hidden>
+          <span class="table-state__symbol" aria-hidden="true">!</span>
+          <h3>Não foi possível carregar os eventos</h3>
+          <p id="eventsErrorText">Verifique a conexão e tente novamente.</p>
+          <button id="retryEvents" class="button button--secondary" type="button">Tentar novamente</button>
+        </div>
+      </div>
+
+      <div class="pagination" aria-label="Paginação dos eventos">
+        <span id="paginationSummary">0 eventos</span>
+        <div>
+          <button id="previousPage" class="button button--secondary button--compact" type="button" disabled>Anterior</button>
+          <span id="pageIndicator" aria-live="polite">Página 1</span>
+          <button id="nextPage" class="button button--secondary button--compact" type="button" disabled>Próxima</button>
+        </div>
+      </div>
+    </section>
+
+    <p class="audit-disclaimer">
+      A classificação contextual apoia a auditoria. Ela não controla a fechadura, não comprova irregularidade e não substitui revisão humana.
+    </p>
+  </main>
+
+  <dialog id="eventDialog" class="event-dialog" aria-labelledby="detailTitle">
+    <div class="dialog-shell">
+      <header class="dialog-header">
+        <div>
+          <p class="section-kicker">Registro de auditoria</p>
+          <h2 id="detailTitle">Detalhes do evento</h2>
+          <p id="detailEventId" class="detail-event-id"></p>
+        </div>
+        <button id="closeDialog" class="icon-button" type="button" aria-label="Fechar detalhes">×</button>
+      </header>
+
+      <div id="detailLoading" class="detail-state">
+        <span class="spinner" aria-hidden="true"></span>
+        <p>Carregando detalhes…</p>
+      </div>
+      <div id="detailError" class="detail-state detail-state--error" hidden>
+        <span class="table-state__symbol" aria-hidden="true">!</span>
+        <p id="detailErrorText">Não foi possível carregar este evento.</p>
+      </div>
+      <div id="detailContent" class="dialog-content" hidden></div>
+
+      <footer class="dialog-footer">
+        <button id="detailPdfButton" class="button button--report" type="button" disabled>
+          <span aria-hidden="true">↓</span>
+          Baixar PDF do evento
+        </button>
+        <button class="button button--secondary" type="button" data-dialog-close>Fechar</button>
+      </footer>
+    </div>
+  </dialog>
+
+  <div id="toastRegion" class="toast-region" aria-live="assertive" aria-atomic="true"></div>
+
+  <noscript>
+    <div class="noscript-warning">
+      Este painel precisa de JavaScript para consultar e atualizar os eventos. A API continua disponível em <code>/docs</code>.
+    </div>
+  </noscript>
+</body>
+</html>

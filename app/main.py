@@ -1,0 +1,592 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import json
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from time import perf_counter
+from typing import AsyncIterator
+from zoneinfo import ZoneInfo
+
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+from .alerts import AlertWorker
+from .config import PROJECT_DIR, Settings
+from .database import Repository, utc_now
+from .models import AccessEventIn, Decision, RiskLevel
+from .reports import build_consolidated_pdf, build_event_pdf
+from .risk_engine import evaluate_access
+
+
+templates = Jinja2Templates(directory=str(PROJECT_DIR / "app" / "templates"))
+http_basic = HTTPBasic(auto_error=False)
+
+
+class EventBroker:
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue[dict]] = set()
+
+    async def publish(self, message: dict) -> None:
+        for queue in tuple(self._subscribers):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            queue.put_nowait(message)
+
+    async def stream(self) -> AsyncIterator[str]:
+        queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=50)
+        self._subscribers.add(queue)
+        try:
+            yield "retry: 3000\n\n"
+            while True:
+                try:
+                    message = await asyncio.wait_for(queue.get(), timeout=15)
+                    yield f"event: access-event\ndata: {json.dumps(message, ensure_ascii=False)}\n\n"
+                except TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            self._subscribers.discard(queue)
+
+
+def _settings(request: Request) -> Settings:
+    return request.app.state.settings
+
+
+def _repository(request: Request) -> Repository:
+    return request.app.state.repository
+
+
+def require_camera_key(
+    request: Request,
+    x_camera_key: str | None = Header(default=None, alias="X-Camera-Key"),
+) -> None:
+    expected = _settings(request).camera_api_key.encode("utf-8")
+    supplied = (x_camera_key or "").encode("utf-8")
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credencial da câmera inválida.",
+        )
+
+
+def require_admin(
+    request: Request,
+    credentials: HTTPBasicCredentials | None = Depends(http_basic),
+) -> str:
+    settings = _settings(request)
+    username = credentials.username if credentials else ""
+    password = credentials.password if credentials else ""
+    valid_username = hmac.compare_digest(
+        username.encode("utf-8"), settings.admin_username.encode("utf-8")
+    )
+    valid_password = hmac.compare_digest(
+        password.encode("utf-8"), settings.admin_password.encode("utf-8")
+    )
+    if not (valid_username and valid_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Autenticação administrativa necessária.",
+            headers={"WWW-Authenticate": 'Basic realm="RAG-Audit"'},
+        )
+    return username
+
+
+def _canonical_payload(event: AccessEventIn) -> tuple[dict, str]:
+    event_data = event.model_dump(mode="json")
+    canonical = dict(event_data)
+    canonical["timestamp"] = event.timestamp.astimezone(UTC).isoformat()
+    encoded = json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return event_data, hashlib.sha256(encoded).hexdigest()
+
+
+def _filters(
+    *,
+    from_timestamp: datetime | None,
+    to_timestamp: datetime | None,
+    room_id: str | None,
+    user_id: str | None,
+    decision: Decision | None,
+    risk_level: RiskLevel | None,
+    alert_status: str | None,
+    q: str | None,
+) -> dict:
+    for value in (from_timestamp, to_timestamp):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise HTTPException(
+                status_code=422,
+                detail="Datas de filtro devem incluir fuso/offset.",
+            )
+        if value is not None:
+            try:
+                if not 2000 <= value.year <= 2100:
+                    raise ValueError
+                value.astimezone(UTC)
+            except (OverflowError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Data de filtro fora da faixa operacional (2000–2100).",
+                ) from exc
+    if from_timestamp and to_timestamp and from_timestamp > to_timestamp:
+        raise HTTPException(status_code=422, detail="O início do período deve preceder o fim.")
+    return {
+        "from_timestamp": from_timestamp,
+        "to_timestamp": to_timestamp,
+        "room_id": room_id,
+        "user_id": user_id,
+        "decision": decision.value if decision else None,
+        "risk_level": risk_level.value if risk_level else None,
+        "alert_status": alert_status,
+        "q": q,
+    }
+
+
+def _summary(event: dict) -> dict:
+    excluded = {"raw_payload", "context_snapshot", "source_ids"}
+    return {key: value for key, value in event.items() if key not in excluded}
+
+
+def _webhook_receipt(event: dict, *, idempotent_replay: bool) -> dict:
+    alert = event.get("alert")
+    safe_alert = (
+        {"alert_id": alert["alert_id"], "status": alert["status"]} if alert else None
+    )
+    return {
+        "idempotent_replay": idempotent_replay,
+        "event": {
+            "event_id": event["event_id"],
+            "decision": event["decision"],
+            "risk_level": event["risk_level"],
+            "risk_score": event["risk_score"],
+            "reason_codes": event["reason_codes"],
+            "alert_required": event["alert_required"],
+            "alert": safe_alert,
+            "policy_version": event["policy_version"],
+            "processing_ms": event["processing_ms"],
+        },
+    }
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    app_settings = settings or Settings.from_env()
+    app_settings.validate()
+    repository = Repository(app_settings.database_path)
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        repository.initialize()
+        if app_settings.seed_demo_data:
+            repository.seed_demo_data(app_settings.policy_version)
+        stop_event = asyncio.Event()
+        worker = AlertWorker(repository, app_settings)
+        application.state.alert_worker = worker
+        application.state.alert_stop_event = stop_event
+        worker_task = asyncio.create_task(worker.run(stop_event), name="rag-audit-alert-worker")
+        application.state.alert_worker_task = worker_task
+        try:
+            yield
+        finally:
+            stop_event.set()
+            await worker_task
+
+    application = FastAPI(
+        title="RAG-Audit",
+        description=(
+            "Auditoria contextual de acessos a salas críticas. "
+            "A classificação não controla a fechadura nem substitui revisão humana."
+        ),
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    application.state.settings = app_settings
+    application.state.repository = repository
+    application.state.broker = EventBroker()
+    application.mount(
+        "/static", StaticFiles(directory=str(PROJECT_DIR / "app" / "static")), name="static"
+    )
+
+    @application.middleware("http")
+    async def privacy_and_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
+        if request.url.path.startswith(("/v1/", "/dashboard", "/docs", "/openapi")):
+            response.headers["Cache-Control"] = "no-store, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+        if request.url.path == "/dashboard":
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; script-src 'self'; style-src 'self'; "
+                "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+                "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+            )
+        return response
+
+    @application.get("/", include_in_schema=False)
+    async def root() -> RedirectResponse:
+        return RedirectResponse(url="/dashboard", status_code=307)
+
+    @application.get("/health/live", tags=["health"])
+    async def health_live() -> dict:
+        return {"status": "ok"}
+
+    @application.get("/health/ready", tags=["health"])
+    async def health_ready(request: Request) -> JSONResponse:
+        database_ready = await asyncio.to_thread(_repository(request).healthcheck)
+        policies_ready = await asyncio.to_thread(
+            _repository(request).policy_set_ready, app_settings.policy_version
+        )
+        worker_task = getattr(request.app.state, "alert_worker_task", None)
+        worker_ready = worker_task is not None and not worker_task.done()
+        ready = database_ready and worker_ready and policies_ready
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "unavailable",
+                "database": database_ready,
+                "alert_worker": worker_ready,
+                "policies": policies_ready,
+            },
+        )
+
+    @application.get("/openapi.json", include_in_schema=False)
+    async def protected_openapi(
+        _admin: str = Depends(require_admin),
+    ) -> JSONResponse:
+        return JSONResponse(application.openapi())
+
+    @application.get("/docs", include_in_schema=False)
+    async def protected_docs(
+        _admin: str = Depends(require_admin),
+    ) -> HTMLResponse:
+        return get_swagger_ui_html(
+            openapi_url="/openapi.json",
+            title="RAG-Audit · Documentação da API",
+        )
+
+    @application.post(
+        "/v1/webhooks/access-events",
+        tags=["camera"],
+        summary="Receber um evento idempotente da câmera",
+        dependencies=[Depends(require_camera_key)],
+    )
+    async def receive_access_event(
+        event: AccessEventIn,
+        request: Request,
+        background_tasks: BackgroundTasks,
+    ) -> JSONResponse:
+        started = perf_counter()
+        received_at = utc_now()
+        repo = _repository(request)
+        event_data, payload_hash = _canonical_payload(event)
+
+        existing = await asyncio.to_thread(repo.get_idempotency_record, event.event_id)
+        if existing:
+            if existing["payload_hash"] != payload_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="event_id já existe com conteúdo diferente.",
+                )
+            saved = await asyncio.to_thread(repo.get_event, event.event_id)
+            return JSONResponse(
+                status_code=200,
+                content=_webhook_receipt(saved, idempotent_replay=True),
+            )
+
+        if app_settings.enforce_event_freshness:
+            event_instant = event.timestamp.astimezone(UTC)
+            age_seconds = (received_at - event_instant).total_seconds()
+            if age_seconds > app_settings.event_max_age_seconds:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Evento antigo demais para o webhook em tempo real.",
+                )
+            if age_seconds < -app_settings.event_future_skew_seconds:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Evento futuro além da tolerância de relógio.",
+                )
+
+        context = await asyncio.to_thread(
+            repo.get_access_context,
+            event.camera_id,
+            event.user_id,
+            app_settings.policy_version,
+        )
+        camera = context.get("camera")
+        if camera is None or not camera["active"]:
+            raise HTTPException(status_code=403, detail="Câmera desconhecida ou inativa.")
+        if camera["room_id"] != event.room_id:
+            raise HTTPException(
+                status_code=403,
+                detail="A sala informada não corresponde à câmera cadastrada.",
+            )
+
+        evaluation = evaluate_access(
+            event,
+            context,
+            fallback_timezone=app_settings.local_timezone,
+        )
+        if not evaluation.context_snapshot.get("policies"):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Nenhuma política aplicável foi encontrada para a decisão; "
+                    "o evento não foi gravado."
+                ),
+            )
+        evaluation_data = evaluation.model_dump(mode="json")
+        initial_ms = (perf_counter() - started) * 1000
+        save_result = await asyncio.to_thread(
+            repo.save_evaluated_event,
+            event=event_data,
+            payload_hash=payload_hash,
+            evaluation=evaluation_data,
+            received_at=received_at,
+            policy_version=app_settings.policy_version,
+            alert_channel=app_settings.alert_channel,
+            processing_ms=initial_ms,
+            alert_include_personal_data=app_settings.alert_include_personal_data,
+            public_base_url=app_settings.public_base_url,
+        )
+        if save_result["state"] == "conflict":
+            raise HTTPException(status_code=409, detail="event_id concorrente com conteúdo diferente.")
+        if save_result["state"] == "duplicate":
+            saved = await asyncio.to_thread(repo.get_event, event.event_id)
+            return JSONResponse(
+                status_code=200,
+                content=_webhook_receipt(saved, idempotent_replay=True),
+            )
+
+        processing_ms = (perf_counter() - started) * 1000
+        await asyncio.to_thread(
+            repo.finalize_processing, event.event_id, utc_now(), processing_ms
+        )
+        saved = await asyncio.to_thread(repo.get_event, event.event_id)
+        await request.app.state.broker.publish(
+            {
+                "event_id": event.event_id,
+                "decision": evaluation.decision.value,
+                "risk_level": evaluation.risk_level.value,
+            }
+        )
+        if evaluation.alert_required:
+            background_tasks.add_task(request.app.state.alert_worker.process_once)
+        return JSONResponse(
+            status_code=status.HTTP_201_CREATED,
+            content=_webhook_receipt(saved, idempotent_replay=False),
+        )
+
+    @application.get("/v1/access-events", tags=["audit"])
+    async def list_access_events(
+        request: Request,
+        _admin: str = Depends(require_admin),
+        from_timestamp: datetime | None = Query(default=None, alias="from"),
+        to_timestamp: datetime | None = Query(default=None, alias="to"),
+        room_id: str | None = None,
+        user_id: str | None = None,
+        decision: Decision | None = None,
+        risk_level: RiskLevel | None = None,
+        alert_status: str | None = None,
+        q: str | None = Query(default=None, max_length=100),
+        limit: int = Query(default=100, ge=1, le=500),
+        offset: int = Query(default=0, ge=0),
+    ) -> dict:
+        event_filters = _filters(
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            room_id=room_id,
+            user_id=user_id,
+            decision=decision,
+            risk_level=risk_level,
+            alert_status=alert_status,
+            q=q,
+        )
+        events, total = await asyncio.to_thread(
+            _repository(request).list_events,
+            event_filters,
+            limit=limit,
+            offset=offset,
+        )
+        return {
+            "items": [_summary(event) for event in events],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "generated_at": utc_now().isoformat(),
+        }
+
+    @application.get("/v1/access-events/stream", tags=["audit"])
+    async def access_event_stream(
+        request: Request, _admin: str = Depends(require_admin)
+    ) -> StreamingResponse:
+        return StreamingResponse(
+            request.app.state.broker.stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    @application.get("/v1/access-events/{event_id}", tags=["audit"])
+    async def get_access_event(
+        event_id: str,
+        request: Request,
+        _admin: str = Depends(require_admin),
+    ) -> dict:
+        event = await asyncio.to_thread(_repository(request).get_event, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Evento não encontrado.")
+        return event
+
+    @application.get("/v1/metrics", tags=["audit"])
+    async def get_metrics(
+        request: Request,
+        _admin: str = Depends(require_admin),
+        from_timestamp: datetime | None = Query(default=None, alias="from"),
+        to_timestamp: datetime | None = Query(default=None, alias="to"),
+        room_id: str | None = None,
+        user_id: str | None = None,
+        decision: Decision | None = None,
+        risk_level: RiskLevel | None = None,
+        alert_status: str | None = None,
+        q: str | None = Query(default=None, max_length=100),
+    ) -> dict:
+        event_filters = _filters(
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            room_id=room_id,
+            user_id=user_id,
+            decision=decision,
+            risk_level=risk_level,
+            alert_status=alert_status,
+            q=q,
+        )
+        return await asyncio.to_thread(_repository(request).metrics, event_filters)
+
+    @application.get("/v1/rooms", tags=["audit"])
+    async def get_rooms(
+        request: Request, _admin: str = Depends(require_admin)
+    ) -> dict:
+        return {"items": await asyncio.to_thread(_repository(request).list_rooms)}
+
+    @application.get("/v1/access-events/{event_id}/report.pdf", tags=["reports"])
+    async def event_report(
+        event_id: str,
+        request: Request,
+        _admin: str = Depends(require_admin),
+    ) -> Response:
+        event = await asyncio.to_thread(_repository(request).get_event, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Evento não encontrado.")
+        event_timezone = (
+            event.get("context_snapshot", {}).get("room", {}).get("timezone")
+            or app_settings.local_timezone
+        )
+        content = await asyncio.to_thread(
+            build_event_pdf, event, event_timezone
+        )
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="rag-audit_evento_{event_id}.pdf"'
+            },
+        )
+
+    @application.get("/v1/reports/access-events.pdf", tags=["reports"])
+    async def consolidated_report(
+        request: Request,
+        admin: str = Depends(require_admin),
+        from_timestamp: datetime | None = Query(default=None, alias="from"),
+        to_timestamp: datetime | None = Query(default=None, alias="to"),
+        room_id: str | None = None,
+        user_id: str | None = None,
+        decision: Decision | None = None,
+        risk_level: RiskLevel | None = None,
+        alert_status: str | None = None,
+        q: str | None = Query(default=None, max_length=100),
+    ) -> Response:
+        event_filters = _filters(
+            from_timestamp=from_timestamp,
+            to_timestamp=to_timestamp,
+            room_id=room_id,
+            user_id=user_id,
+            decision=decision,
+            risk_level=risk_level,
+            alert_status=alert_status,
+            q=q,
+        )
+        events, total = await asyncio.to_thread(
+            _repository(request).list_events,
+            event_filters,
+            limit=app_settings.report_event_limit + 1,
+            offset=0,
+        )
+        if total > app_settings.report_event_limit:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"O relatório excede {app_settings.report_event_limit} eventos; "
+                    "reduza o período ou aplique mais filtros."
+                ),
+            )
+        content = await asyncio.to_thread(
+            build_consolidated_pdf,
+            events,
+            {key: value for key, value in event_filters.items() if value is not None},
+            app_settings.local_timezone,
+            admin,
+        )
+        filename = datetime.now(ZoneInfo(app_settings.local_timezone)).strftime(
+            "rag-audit_acessos_%Y-%m-%d_%H%M.pdf"
+        )
+        return Response(
+            content=content,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @application.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
+    async def dashboard(
+        request: Request, admin: str = Depends(require_admin)
+    ) -> HTMLResponse:
+        return templates.TemplateResponse(
+            request=request,
+            name="dashboard.html",
+            context={
+                "admin": admin,
+                "timezone": app_settings.local_timezone,
+                "environment": app_settings.environment,
+                "demo_mode": app_settings.seed_demo_data,
+            },
+        )
+
+    return application
+
+
+# Importado pelo Uvicorn: `uvicorn app.main:app`.
+app = create_app()

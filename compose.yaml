@@ -1,0 +1,43 @@
+services:
+  rag-audit:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      RAG_AUDIT_DB_PATH: /app/data/rag_audit.db
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=2)",
+        ]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  vision-worker:
+    profiles: ["vision"]
+    build:
+      context: .
+      dockerfile: Dockerfile.vision
+    env_file:
+      - .env
+    environment:
+      RAG_AUDIT_API_BASE_URL: http://rag-audit:8000
+      RAG_AUDIT_VISION_MODELS_DIR: /app/vision-models
+      RAG_AUDIT_GALLERY_MANIFEST: /app/data/private/gallery/manifest.json
+      RAG_AUDIT_CAMERA_CALIBRATION: /app/data/private/camera-calibration.json
+      RAG_AUDIT_VISION_OUTBOX_PATH: /app/data/private/vision-outbox.db
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      rag-audit:
+        condition: service_healthy
+    restart: unless-stopped

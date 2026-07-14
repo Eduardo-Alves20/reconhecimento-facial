@@ -1,0 +1,19 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    RAG_AUDIT_VISION_MODELS_DIR=/app/vision-models
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY pyproject.toml README.md ./
+COPY app ./app
+COPY scripts ./scripts
+RUN python -m pip install --no-cache-dir ".[vision]" \
+    && python scripts/download_vision_models.py
+
+CMD ["python", "scripts/run_vision_worker.py"]

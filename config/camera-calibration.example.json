@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "camera_id": "cam-ti-01",
+  "room_id": "sala_ti_01",
+  "door_zone": [[0.10, 0.10], [0.48, 0.10], [0.48, 0.90], [0.10, 0.90]],
+  "inside_zone": [[0.52, 0.10], [0.95, 0.10], [0.95, 0.90], [0.52, 0.90]],
+  "entry_line": {
+    "start": [0.50, 0.05],
+    "end": [0.50, 0.95],
+    "inside_side": "right"
+  },
+  "min_door_observations": 2,
+  "min_inside_observations": 2,
+  "track_timeout_seconds": 5,
+  "cooldown_seconds": 10
+}

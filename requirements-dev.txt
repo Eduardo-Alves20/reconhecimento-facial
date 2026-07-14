@@ -1,0 +1,4 @@
+-r requirements.txt
+httpx2>=2.6,<3.0
+pypdf>=5.0,<7.0
+pytest>=8.3,<10.0
