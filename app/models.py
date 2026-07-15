@@ -38,8 +38,16 @@ class IdentityStatus(StrEnum):
 class EntryEvidence(StrEnum):
     UNSPECIFIED = "UNSPECIFIED"
     VISION_LINE_CROSSING = "VISION_LINE_CROSSING"
+    VISION_FACE_AT_DOOR = "VISION_FACE_AT_DOOR"
     DOOR_SENSOR = "DOOR_SENSOR"
     ACCESS_CONTROLLER = "ACCESS_CONTROLLER"
+
+
+# Evidências puramente visuais: a câmera observa, mas não prova a liberação da
+# fechadura. Todas exigem door_result=NOT_REPORTED e um track_id.
+_VISUAL_ENTRY_EVIDENCE = frozenset(
+    {EntryEvidence.VISION_LINE_CROSSING, EntryEvidence.VISION_FACE_AT_DOOR}
+)
 
 
 class RecognitionSource(StrEnum):
@@ -68,6 +76,9 @@ class AccessEventIn(BaseModel):
     recognition_margin: float | None = Field(default=None, ge=0.0, le=2.0)
     face_quality: float | None = Field(default=None, ge=0.0, le=1.0)
     entry_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Referência opaca (SHA-256 em hex) para a foto guardada em armazenamento
+    # privado. A imagem em si nunca trafega no webhook.
+    evidence_ref: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
     @field_validator("timestamp")
     @classmethod
@@ -84,7 +95,7 @@ class AccessEventIn(BaseModel):
 
     @model_validator(mode="after")
     def visual_entry_has_honest_door_semantics(self) -> "AccessEventIn":
-        if self.entry_evidence == EntryEvidence.VISION_LINE_CROSSING:
+        if self.entry_evidence in _VISUAL_ENTRY_EVIDENCE:
             if self.door_result != DoorResult.NOT_REPORTED:
                 raise ValueError(
                     "entrada visual deve usar door_result=NOT_REPORTED; a câmera não prova a liberação da porta"

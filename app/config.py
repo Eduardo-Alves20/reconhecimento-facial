@@ -29,6 +29,7 @@ def _environment_bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_path: Path = PROJECT_DIR / "data" / "rag_audit.db"
+    evidence_dir: Path = PROJECT_DIR / "data" / "private" / "evidence"
     camera_api_key: str = "dev-camera-key"
     admin_username: str = "admin"
     admin_password: str = "change-me"
@@ -57,6 +58,12 @@ class Settings:
         return cls(
             database_path=Path(
                 os.getenv("RAG_AUDIT_DB_PATH", str(PROJECT_DIR / "data" / "rag_audit.db"))
+            ),
+            evidence_dir=Path(
+                os.getenv(
+                    "RAG_AUDIT_VISION_EVIDENCE_DIR",
+                    str(PROJECT_DIR / "data" / "private" / "evidence"),
+                )
             ),
             camera_api_key=os.getenv("RAG_AUDIT_CAMERA_API_KEY", "dev-camera-key"),
             admin_username=os.getenv("RAG_AUDIT_ADMIN_USERNAME", "admin"),

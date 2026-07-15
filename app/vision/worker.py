@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,8 +28,9 @@ from .entry_tracker import (
 )
 from .face_tracking import ConsensusResult, FaceCentroidTracker, IdentityConsensus
 from .identity import IDENTIFIER_RE, safe_person_id
+from .learned import LearnedGallery
 from .outbox import VisionEventOutbox
-from .recognizer import MatchDecision, MatchStatus, MatchThresholds, OpenCVSFaceEngine
+from .recognizer import ArcFaceEngine, MatchDecision, MatchStatus, MatchThresholds
 
 
 class VisionConfigurationError(ValueError):
@@ -78,8 +81,11 @@ class VisionWorkerSettings:
     detector_model: Path
     recognizer_model: Path
     outbox_path: Path
+    evidence_dir: Path
     sample_fps: float = 4.0
     dry_run: bool = False
+    mode: str = "door"
+    min_door_frames: int = 3
     thresholds: MatchThresholds = MatchThresholds()
 
     @classmethod
@@ -141,10 +147,20 @@ class VisionWorkerSettings:
                     str(project_root / "data" / "private" / "vision-outbox.db"),
                 )
             ),
+            evidence_dir=Path(
+                os.getenv(
+                    "RAG_AUDIT_VISION_EVIDENCE_DIR",
+                    str(project_root / "data" / "private" / "evidence"),
+                )
+            ),
             sample_fps=_float_env(
                 "RAG_AUDIT_VISION_SAMPLE_FPS", 4.0, minimum=0.5, maximum=15.0
             ),
             dry_run=_bool_env("RAG_AUDIT_VISION_DRY_RUN", False),
+            mode=(os.getenv("RAG_AUDIT_VISION_MODE", "door").strip().lower() or "door"),
+            min_door_frames=int(
+                _float_env("RAG_AUDIT_VISION_MIN_DOOR_FRAMES", 3, minimum=1, maximum=30)
+            ),
             thresholds=MatchThresholds(
                 similarity=_float_env(
                     "RAG_AUDIT_FACE_SIMILARITY_THRESHOLD", 0.55, minimum=0, maximum=1
@@ -246,6 +262,352 @@ def build_access_event(
     }
 
 
+def _crop_face(frame: Any, face: Any, *, margin: float) -> Any | None:
+    """Recorta o rosto com margem proporcional; ``None`` se inviável."""
+
+    try:
+        height, width = frame.shape[:2]
+        x, y, box_width, box_height = (int(value) for value in face.bbox)
+        margin_x = int(box_width * margin)
+        margin_y = int(box_height * margin)
+        x1 = max(0, x - margin_x)
+        y1 = max(0, y - margin_y)
+        x2 = min(width, x + box_width + margin_x)
+        y2 = min(height, y + box_height + margin_y)
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size else None
+    except Exception:
+        return None
+
+
+def _write_jpeg(cv2: Any, image: Any, destination: Path, quality: int) -> bool:
+    ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return False
+    if not destination.exists():
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        temporary.write_bytes(buffer.tobytes())
+        os.replace(temporary, destination)
+    return True
+
+
+def save_evidence(cv2: Any, frame: Any, face: Any, evidence_dir: Path) -> str | None:
+    """Guarda a cena completa e um recorte do rosto em armazenamento privado.
+
+    Devolve o SHA-256 da cena completa como referência opaca; a imagem nunca
+    trafega pelo webhook. O recorte fica em ``<sha>.thumb.jpg`` para a lista.
+    """
+
+    try:
+        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            return None
+        data = buffer.tobytes()
+        digest = hashlib.sha256(data).hexdigest()
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        full_path = evidence_dir / f"{digest}.jpg"
+        if not full_path.exists():
+            temporary = full_path.with_suffix(".jpg.tmp")
+            temporary.write_bytes(data)
+            os.replace(temporary, full_path)
+        crop = _crop_face(frame, face, margin=0.6)
+        if crop is not None:
+            _write_jpeg(cv2, crop, evidence_dir / f"{digest}.thumb.jpg", 88)
+        return digest
+    except Exception:
+        return None
+
+
+def build_door_event(
+    *,
+    session_id: str,
+    track_id: str,
+    camera_id: str,
+    room_id: str,
+    consensus: ConsensusResult,
+    model_version: str,
+    evidence_ref: str | None,
+    confirmed_at: datetime,
+    observation_count: int,
+) -> dict[str, Any]:
+    """Evento de 'rosto reconhecido na porta' (sem prova de direção)."""
+
+    if consensus.status == MatchStatus.MATCHED and consensus.external_id:
+        user_id = safe_person_id(consensus.external_id)
+        identity_status = "MATCHED"
+        confidence = max(0.0, min(1.0, consensus.similarity or 0.0))
+    elif consensus.status == MatchStatus.AMBIGUOUS:
+        user_id = f"AMBIGUOUS:{session_id}"
+        identity_status = "AMBIGUOUS"
+        confidence = None
+    else:
+        user_id = f"UNKNOWN:{session_id}"
+        identity_status = "UNKNOWN"
+        confidence = None
+    payload: dict[str, Any] = {
+        "event_id": f"entry:{session_id}",
+        "camera_id": camera_id,
+        "user_id": user_id,
+        "room_id": room_id,
+        "timestamp": confirmed_at.isoformat(),
+        "door_result": "NOT_REPORTED",
+        "recognition_confidence": confidence,
+        "identity_status": identity_status,
+        "entry_evidence": "VISION_FACE_AT_DOOR",
+        "recognition_source": "LOCAL_SFACE",
+        "track_id": track_id,
+        "recognition_model": model_version,
+        "recognition_margin": consensus.margin,
+        "face_quality": consensus.face_quality,
+        "entry_confidence": min(1.0, observation_count / 6.0),
+    }
+    if evidence_ref:
+        payload["evidence_ref"] = evidence_ref
+    return payload
+
+
+class DoorEventProcessor:
+    """Registra o acesso quando um rosto persiste na zona da porta.
+
+    Não tenta provar direção (entrar/sair). Como a porta tem fechadura, quem é
+    reconhecido ali é quem está acessando. Guarda a melhor foto do rosto e
+    enfileira o evento uma única vez por presença.
+    """
+
+    def __init__(
+        self,
+        engine: "RecognitionEngine",
+        door_zone: Polygon,
+        outbox: VisionEventOutbox,
+        *,
+        camera_id: str,
+        room_id: str,
+        evidence_dir: Path,
+        min_door_frames: int = 3,
+        cooldown: timedelta = timedelta(seconds=15),
+        learned: LearnedGallery | None = None,
+        learn_min_similarity: float = 0.50,
+        learn_max_similarity: float = 0.85,
+        learn_min_quality: float = 0.50,
+    ) -> None:
+        self.engine = engine
+        self.door_zone = door_zone
+        self.outbox = outbox
+        self.camera_id = camera_id
+        self.room_id = room_id
+        self.evidence_dir = evidence_dir
+        self.min_door_frames = min_door_frames
+        self.cooldown = cooldown
+        # Auto-aprendizado: aprende novas referências das pessoas reconhecidas.
+        self.learned = learned
+        self.learn_min_similarity = learn_min_similarity
+        self.learn_max_similarity = learn_max_similarity
+        self.learn_min_quality = learn_min_quality
+        self.cv2 = engine.cv2  # type: ignore[attr-defined]
+        # Mantém a mesma trilha viva por alguns segundos mesmo se o rosto some
+        # por um instante (a pessoa vira a cabeça), para acumular vários ângulos
+        # numa passagem só. Histórico maior guarda mais ângulos para a decisão.
+        self.face_tracker = FaceCentroidTracker(max_age=timedelta(seconds=4))
+        # ArcFace separa bem (errado ~0,00), então 2 quadros já bastam — ajuda a
+        # reconhecer quem aparece por poucos quadros (a pessoa de trás).
+        self.consensus = IdentityConsensus(history_size=30, minimum_matches=2)
+        self._known: set[str] = set()
+        self._door_hits: dict[str, int] = {}
+        self._best: dict[str, tuple[float, Any, Any]] = {}
+        self._last_seen: dict[str, datetime] = {}
+        # Trilhas que já registraram alguém reconhecido (para não emitir também
+        # um 'desconhecido' no fim). Uma trilha pode registrar mais de uma pessoa.
+        self._track_matched: set[str] = set()
+        # Presença: enquanto a pessoa continua aparecendo não registra de novo;
+        # só reconta após ausência (saiu e voltou = nova entrada).
+        self._present_until: dict[str, datetime] = {}
+        self._absence_gap = timedelta(seconds=5)
+        # Movimento por trilha: só conta quem CHEGOU (se moveu na porta), não quem
+        # está parado no enquadramento (ex.: pessoa sentada na direção da porta).
+        self._track_origin: dict[str, tuple[float, float]] = {}
+        self._track_moved: set[str] = set()
+        # Desconhecidos recentes (instante, embedding) para deduplicar por rosto.
+        self._recent_unknowns: list[tuple[datetime, Any]] = []
+        self._last_log: datetime | None = None
+
+    def process_frame(self, frame: Any, observed_at: datetime) -> list[dict[str, Any]]:
+        emitted: list[dict[str, Any]] = []
+        faces = self.engine.detect(frame)
+        frame_log: list[str] = []
+        for tracked in self.face_tracker.update(faces, observed_at):
+            track_id = tracked.track_id
+            self._known.add(track_id)
+            decision = self.engine.match(tracked.face)
+            # Se outra pessoa confiável assumiu a mesma trilha (carona: o de trás
+            # ocupa o lugar do da frente), zera o consenso para ela não ser
+            # absorvida pela identidade anterior.
+            if decision.status == MatchStatus.MATCHED and decision.external_id:
+                current = self.consensus.resolve(track_id)
+                if (
+                    current.status == MatchStatus.MATCHED
+                    and current.external_id
+                    and current.external_id != decision.external_id
+                ):
+                    self.consensus.discard(track_id)
+                    self._track_matched.discard(track_id)
+            self.consensus.add(track_id, decision)
+            cx, cy = tracked.face.centroid
+            in_door = self.door_zone.contains(Point(cx, cy))
+            who = decision.display_name or decision.status.value
+            frame_log.append(
+                f"({cx:.2f},{cy:.2f}){'PORTA' if in_door else 'fora'}:"
+                f"{who[:16]} q{tracked.face.quality:.2f}"
+            )
+            if not in_door:
+                continue
+            self._door_hits[track_id] = self._door_hits.get(track_id, 0) + 1
+            self._last_seen[track_id] = observed_at
+            # Marca a trilha como "chegou" quando o rosto se desloca na porta;
+            # quem fica parado (sentado) nunca é marcado e não vira entrada.
+            origin = self._track_origin.setdefault(track_id, (cx, cy))
+            if track_id not in self._track_moved and (
+                abs(cx - origin[0]) + abs(cy - origin[1]) > 0.05
+            ):
+                self._track_moved.add(track_id)
+            quality = tracked.face.quality
+            if track_id not in self._best or quality > self._best[track_id][0]:
+                # Guarda o melhor quadro na memória; grava só ao decidir.
+                self._best[track_id] = (quality, frame.copy(), tracked.face)
+            if self._door_hits[track_id] < self.min_door_frames:
+                continue
+            result = self.consensus.resolve(track_id)
+            if result.status == MatchStatus.MATCHED and result.external_id:
+                previous = self._present_until.get(result.external_id)
+                still_present = previous is not None and observed_at < previous
+                if still_present:
+                    # Já registrada nesta visita: só mantém a presença viva
+                    # (para não recontar enquanto a pessoa continua na sala).
+                    self._present_until[result.external_id] = (
+                        observed_at + self._absence_gap
+                    )
+                elif track_id in self._track_moved:
+                    # Chegou (se moveu na porta) e não está presente: registra
+                    # e só ENTÃO marca presença. Marcar antes de registrar
+                    # bloqueava a própria entrada.
+                    payload = self._emit_decision(track_id, observed_at, result)
+                    if payload is not None:
+                        self._present_until[result.external_id] = (
+                            observed_at + self._absence_gap
+                        )
+                        self._track_matched.add(track_id)
+                        emitted.append(payload)
+        # Log throttled do que a câmera vê, para diagnóstico ao vivo.
+        if faces and (
+            self._last_log is None
+            or (observed_at - self._last_log).total_seconds() >= 1.5
+        ):
+            self._last_log = observed_at
+            print(f"[visao] {len(faces)} rosto(s): {frame_log}", flush=True)
+        emitted.extend(self._flush_expired(observed_at))
+        return emitted
+
+    def _same_recent_unknown(self, feature: Any, observed_at: datetime) -> bool:
+        """Verdadeiro se este rosto já apareceu como desconhecido há pouco.
+
+        Deduplica 'desconhecido' pela aparência (não pelo tempo), então dois
+        desconhecidos DIFERENTES entrando juntos geram dois registros, mas a
+        mesma pessoa perdida e readquirida gera um só.
+        """
+
+        self._recent_unknowns = [
+            (moment, embedding)
+            for moment, embedding in self._recent_unknowns
+            if observed_at < moment + self.cooldown
+        ]
+        for _, embedding in self._recent_unknowns:
+            if self.engine.similarity(feature, embedding) >= 0.45:
+                return True
+        return False
+
+    def _emit_decision(
+        self, track_id: str, when: datetime, result: ConsensusResult
+    ) -> dict[str, Any] | None:
+        best = self._best.get(track_id)
+        feature = best[2].feature if best is not None else None
+        matched = result.status == MatchStatus.MATCHED and bool(result.external_id)
+        if not matched and feature is not None and self._same_recent_unknown(feature, when):
+            return None
+        session_id = f"vis-{uuid.uuid4().hex}"
+        evidence_ref = (
+            save_evidence(self.cv2, best[1], best[2], self.evidence_dir)
+            if best is not None
+            else None
+        )
+        payload = build_door_event(
+            session_id=session_id,
+            track_id=track_id,
+            camera_id=self.camera_id,
+            room_id=self.room_id,
+            consensus=result,
+            model_version=self.engine.model_version,
+            evidence_ref=evidence_ref,
+            confirmed_at=when,
+            observation_count=self._door_hits.get(track_id, 0),
+        )
+        self.outbox.enqueue(payload, now=when)
+        if matched and self.learned is not None and feature is not None:
+            if self.learned.consider(
+                self.engine,
+                external_id=result.external_id,
+                display_name=result.display_name,
+                feature=feature,
+                evidence_ref=evidence_ref,
+                when=when,
+                similarity=result.similarity,
+                quality=result.face_quality,
+                min_similarity=self.learn_min_similarity,
+                max_similarity=self.learn_max_similarity,
+                min_quality=self.learn_min_quality,
+            ):
+                print(
+                    f"[aprendizado] nova referência de {result.display_name} "
+                    f"(sim={result.similarity:.2f}).",
+                    flush=True,
+                )
+        elif not matched and feature is not None:
+            self._recent_unknowns.append((when, feature))
+        return payload
+
+    def _flush_expired(self, observed_at: datetime) -> list[dict[str, Any]]:
+        """Finaliza trilhas que sumiram (a pessoa saiu da porta).
+
+        Quem nunca foi reconhecido com certeza durante a passagem — e ficou
+        tempo suficiente na porta — é registrado como desconhecido só agora.
+        """
+
+        active = set(self.face_tracker.active_track_ids)
+        emitted: list[dict[str, Any]] = []
+        for track_id in list(self._known - active):
+            if (
+                track_id not in self._track_matched
+                and track_id in self._track_moved
+                and self._door_hits.get(track_id, 0) >= self.min_door_frames
+            ):
+                result = self.consensus.resolve(track_id)
+                when = self._last_seen.get(track_id, observed_at)
+                payload = self._emit_decision(track_id, when, result)
+                if payload is not None:
+                    emitted.append(payload)
+            self._door_hits.pop(track_id, None)
+            self._best.pop(track_id, None)
+            self._last_seen.pop(track_id, None)
+            self._track_matched.discard(track_id)
+            self._track_origin.pop(track_id, None)
+            self._track_moved.discard(track_id)
+            self.consensus.discard(track_id)
+            self._known.discard(track_id)
+        for person_key in [
+            key for key, until in self._present_until.items() if observed_at >= until
+        ]:
+            self._present_until.pop(person_key, None)
+        return emitted
+
+
 class RecognitionEngine(Protocol):
     model_version: str
 
@@ -336,22 +698,53 @@ def flush_outbox(
     return sent, failed
 
 
-def create_processor(settings: VisionWorkerSettings) -> VisionProcessor:
+def create_processor(
+    settings: VisionWorkerSettings,
+) -> VisionProcessor | DoorEventProcessor:
     tracker_config = load_entry_tracker_config(
         settings.calibration_path,
         camera_id=settings.camera_id,
         room_id=settings.room_id,
     )
-    engine = OpenCVSFaceEngine(
-        settings.detector_model,
-        settings.recognizer_model,
-        thresholds=settings.thresholds,
-    )
+    engine = ArcFaceEngine(thresholds=settings.thresholds)
     enrolled = engine.load_gallery(settings.gallery_manifest)
     if enrolled < 1:
         raise VisionConfigurationError("A galeria facial está vazia.")
+    learned: LearnedGallery | None = None
+    if settings.mode == "door" and _bool_env("RAG_AUDIT_LEARN_ENABLED", True):
+        learned = LearnedGallery(
+            Path(settings.gallery_manifest).parent / "learned.db",
+            max_per_person=int(
+                _float_env("RAG_AUDIT_LEARN_MAX_PER_PERSON", 5, minimum=1, maximum=50)
+            ),
+        )
+        learned.initialize()
+        learned_count = learned.load_into(engine)
+        if learned_count:
+            print(f"{learned_count} referência(s) aprendida(s) carregada(s).")
     outbox = VisionEventOutbox(settings.outbox_path)
     outbox.initialize()
+    if settings.mode == "door":
+        return DoorEventProcessor(
+            engine,
+            tracker_config.door_zone,
+            outbox,
+            camera_id=settings.camera_id,
+            room_id=settings.room_id,
+            evidence_dir=settings.evidence_dir,
+            min_door_frames=settings.min_door_frames,
+            cooldown=tracker_config.cooldown,
+            learned=learned,
+            learn_min_similarity=_float_env(
+                "RAG_AUDIT_LEARN_MIN_SIMILARITY", 0.50, minimum=0, maximum=1
+            ),
+            learn_max_similarity=_float_env(
+                "RAG_AUDIT_LEARN_MAX_SIMILARITY", 0.85, minimum=0, maximum=1
+            ),
+            learn_min_quality=_float_env(
+                "RAG_AUDIT_LEARN_MIN_QUALITY", 0.50, minimum=0, maximum=1
+            ),
+        )
     return VisionProcessor(engine, EntryTracker(tracker_config), outbox)
 
 

@@ -450,7 +450,21 @@
 
       const personCell = tableCell("Pessoa");
       const personMeta = [event.role_name, event.person_id].filter(Boolean).join(" · ");
-      appendPrimarySecondary(personCell, event.person_name || "Pessoa não identificada", personMeta);
+      const personInner = createElement("div", "person-inner");
+      if (event.has_photo) {
+        const thumb = document.createElement("img");
+        thumb.className = "person-thumb";
+        thumb.src = `/v1/access-events/${encodeURIComponent(event.event_id)}/photo?variant=thumb`;
+        thumb.alt = "Rosto capturado pela câmera";
+        thumb.loading = "lazy";
+        thumb.title = "Foto capturada — clique para ampliar";
+        thumb.addEventListener("click", () => openEventDetail(event.event_id));
+        personInner.append(thumb);
+      }
+      const personText = createElement("div", "person-text");
+      appendPrimarySecondary(personText, event.person_name || "Pessoa não identificada", personMeta);
+      personInner.append(personText);
+      personCell.append(personInner);
 
       const roomCell = tableCell("Sala");
       appendPrimarySecondary(roomCell, event.room_name || event.room_id, event.camera_id || "");
@@ -805,6 +819,24 @@
     const context = event.context_snapshot || {};
 
     const overview = createElement("div", "detail-overview");
+    const hasPhoto = Boolean(event.raw_payload && event.raw_payload.evidence_ref);
+    if (hasPhoto) {
+      const photoUrl = `/v1/access-events/${encodeURIComponent(event.event_id)}/photo`;
+      const photoLink = document.createElement("a");
+      photoLink.className = "detail-photo-link";
+      photoLink.href = photoUrl;
+      photoLink.target = "_blank";
+      photoLink.rel = "noopener";
+      photoLink.title = "Abrir a foto completa em tamanho real para avaliar";
+      const photo = document.createElement("img");
+      photo.className = "detail-photo";
+      photo.src = photoUrl;
+      photo.alt = "Cena capturada pela câmera no momento do acesso";
+      photoLink.append(photo);
+      const hint = createElement("span", "detail-photo-hint", "Clique para ampliar");
+      photoLink.append(hint);
+      overview.append(photoLink);
+    }
     const identity = createElement("div", "detail-overview__identity");
     identity.append(
       createElement("strong", "", event.person_name || "Pessoa não identificada"),

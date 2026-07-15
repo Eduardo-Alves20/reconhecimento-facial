@@ -6,6 +6,7 @@ carregados somente ao construir o worker de visão.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -77,7 +78,17 @@ def decide_match(
     if not math.isfinite(face_quality):
         raise ValueError("face_quality deve ser finita")
     quality = max(0.0, min(1.0, face_quality))
-    ordered = sorted(candidates, key=lambda item: item.similarity, reverse=True)
+    # Uma pessoa pode ter várias fotos de referência (ângulos diferentes).
+    # Colapsa para a melhor nota por pessoa antes de ranquear, para que a
+    # margem seja medida entre pessoas distintas — não entre fotos da mesma.
+    best_per_person: dict[str, CandidateScore] = {}
+    for candidate in candidates:
+        current = best_per_person.get(candidate.external_id)
+        if current is None or candidate.similarity > current.similarity:
+            best_per_person[candidate.external_id] = candidate
+    ordered = sorted(
+        best_per_person.values(), key=lambda item: item.similarity, reverse=True
+    )
     if quality < thresholds.face_quality:
         return MatchDecision(MatchStatus.LOW_QUALITY, None, None, None, None, quality)
     if not ordered:
@@ -117,24 +128,28 @@ class GalleryEntry:
     feature: Any
 
 
-class OpenCVSFaceEngine:
-    """Adaptador CPU do YuNet/SFace; não oferece prova de vida."""
+class ArcFaceEngine:
+    """Reconhecimento facial com InsightFace (RetinaFace + ArcFace r50).
 
-    model_version = "opencv-yunet-2023mar+sface-2021dec"
+    Embeddings ArcFace de 512 dimensões e normalizados; similaridade por cosseno
+    (produto escalar). A separação entre pessoas é muito melhor que a do SFace,
+    o que permite um limiar mais baixo sem confundir identidades. Não oferece
+    prova de vida.
+    """
+
+    model_version = "insightface-buffalo_l-retinaface-arcface-r50"
 
     def __init__(
         self,
-        detector_model: str | Path,
-        recognizer_model: str | Path,
         *,
         thresholds: MatchThresholds | None = None,
-        detector_score_threshold: float = 0.90,
-        detector_nms_threshold: float = 0.30,
-        detector_top_k: int = 50,
+        model_root: str | Path | None = None,
+        det_size: tuple[int, int] = (640, 640),
     ) -> None:
         try:
             import cv2  # type: ignore[import-not-found]
             import numpy as np  # type: ignore[import-not-found]
+            from insightface.app import FaceAnalysis  # type: ignore[import-not-found]
         except ImportError as exc:
             raise VisionDependencyError(
                 "Instale o extra de visão: python -m pip install -e \".[vision]\""
@@ -143,69 +158,70 @@ class OpenCVSFaceEngine:
         self.cv2 = cv2
         self.np = np
         self.thresholds = thresholds or MatchThresholds()
-        detector_path = Path(detector_model)
-        recognizer_path = Path(recognizer_model)
-        for path in (detector_path, recognizer_path):
-            if not path.is_file():
-                raise VisionModelError(f"Modelo ausente: {path}")
+        options: dict[str, Any] = {
+            "name": "buffalo_l",
+            "providers": ["CPUExecutionProvider"],
+            "allowed_modules": ["detection", "recognition"],
+        }
+        if model_root is not None:
+            options["root"] = str(model_root)
         try:
-            self.detector = cv2.FaceDetectorYN.create(
-                str(detector_path),
-                "",
-                (320, 320),
-                detector_score_threshold,
-                detector_nms_threshold,
-                detector_top_k,
-            )
-            self.recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
+            self.app = FaceAnalysis(**options)
+            self.app.prepare(ctx_id=-1, det_size=det_size)
         except Exception as exc:
-            raise VisionModelError("Não foi possível carregar os modelos YuNet/SFace.") from exc
+            raise VisionModelError(
+                "Não foi possível carregar o modelo ArcFace (buffalo_l)."
+            ) from exc
         self.gallery: list[GalleryEntry] = []
 
-    def _quality(self, frame: Any, face: Any) -> float:
-        height, width = frame.shape[:2]
-        x, y, box_width, box_height = (int(value) for value in face[:4])
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(width, x + box_width), min(height, y + box_height)
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return 0.0
-        detector_score = float(face[-1])
-        size_score = min(1.0, min(box_width, box_height) / 120.0)
-        gray = self.cv2.cvtColor(crop, self.cv2.COLOR_BGR2GRAY)
-        blur_variance = float(self.cv2.Laplacian(gray, self.cv2.CV_64F).var())
-        blur_score = min(1.0, blur_variance / 100.0)
-        return max(0.0, min(1.0, detector_score * size_score * blur_score))
+    def _quality(self, det_score: float, box_width: int, box_height: int) -> float:
+        # O ArcFace já alinha o rosto, então a qualidade foca em confiança da
+        # detecção e tamanho do rosto (rosto minúsculo gera embedding instável).
+        size_score = min(1.0, min(box_width, box_height) / 80.0)
+        return max(0.0, min(1.0, float(det_score) * size_score))
+
+    def similarity(self, first: Any, second: Any) -> float:
+        """Cosseno entre dois embeddings normalizados (produto escalar)."""
+
+        return float(self.np.dot(first, second))
+
+    def add_reference(self, external_id: str, display_name: str, feature: Any) -> None:
+        """Adiciona uma referência à galeria em memória (efeito imediato)."""
+
+        self.gallery.append(
+            GalleryEntry(
+                str(external_id),
+                str(display_name),
+                self.np.asarray(feature, dtype=self.np.float32),
+            )
+        )
 
     def detect(self, frame: Any) -> list[DetectedFace]:
         if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
             raise ValueError("frame inválido")
         height, width = frame.shape[:2]
-        self.detector.setInputSize((int(width), int(height)))
         try:
-            _, faces = self.detector.detect(frame)
+            faces = self.app.get(frame)
         except Exception as exc:
-            raise VisionModelError("Falha ao executar o detector facial.") from exc
-        if faces is None:
-            return []
+            raise VisionModelError("Falha ao executar detecção/reconhecimento.") from exc
         detections: list[DetectedFace] = []
         for face in faces:
-            x, y, box_width, box_height = (int(value) for value in face[:4])
-            try:
-                aligned = self.recognizer.alignCrop(frame, face)
-                feature = self.recognizer.feature(aligned).copy()
-            except Exception:
+            embedding = getattr(face, "normed_embedding", None)
+            if embedding is None:
                 continue
+            x1, y1, x2, y2 = (int(value) for value in face.bbox)
+            box_width = max(1, x2 - x1)
+            box_height = max(1, y2 - y1)
             detections.append(
                 DetectedFace(
-                    bbox=(x, y, box_width, box_height),
+                    bbox=(x1, y1, box_width, box_height),
                     centroid=(
-                        max(0.0, min(1.0, (x + box_width / 2) / width)),
-                        max(0.0, min(1.0, (y + box_height / 2) / height)),
+                        max(0.0, min(1.0, (x1 + box_width / 2) / width)),
+                        max(0.0, min(1.0, (y1 + box_height / 2) / height)),
                     ),
-                    detector_score=float(face[-1]),
-                    quality=self._quality(frame, face),
-                    feature=feature,
+                    detector_score=float(face.det_score),
+                    quality=self._quality(face.det_score, box_width, box_height),
+                    feature=self.np.asarray(embedding, dtype=self.np.float32),
                 )
             )
         return detections
@@ -229,6 +245,23 @@ class OpenCVSFaceEngine:
         if manifest.get("schema_version") != 1 or not isinstance(manifest.get("entries"), list):
             raise GalleryEnrollmentError("Versão ou estrutura do manifesto não suportada.")
 
+        # Impressão digital do conjunto: muda quando alguém é adicionado/removido.
+        fingerprint = hashlib.sha256(
+            "|".join(
+                sorted(
+                    f"{item.get('external_id')}:{item.get('image_sha256', '')}"
+                    for item in manifest["entries"]
+                    if isinstance(item, dict)
+                )
+            ).encode("utf-8")
+            + self.model_version.encode("utf-8")
+        ).hexdigest()
+        cache_file = manifest_file.parent / "embeddings.arcface.npz"
+        cached = self._load_cache(cache_file, fingerprint)
+        if cached is not None:
+            self.gallery = cached
+            return len(cached)
+
         enrolled: list[GalleryEntry] = []
         for item in manifest["entries"]:
             if not isinstance(item, dict):
@@ -249,21 +282,46 @@ class OpenCVSFaceEngine:
             enrolled.append(GalleryEntry(external_id, display_name, faces[0].feature))
         if not enrolled:
             raise GalleryEnrollmentError("Nenhuma foto com exatamente um rosto válido foi importada.")
+        self._save_cache(cache_file, fingerprint, enrolled)
         self.gallery = enrolled
         return len(enrolled)
+
+    def _load_cache(self, cache_file: Path, fingerprint: str) -> list[GalleryEntry] | None:
+        if not cache_file.is_file():
+            return None
+        try:
+            data = self.np.load(cache_file, allow_pickle=False)
+            if str(data["fingerprint"]) != fingerprint:
+                return None
+            ids = [str(v) for v in data["external_ids"]]
+            names = [str(v) for v in data["display_names"]]
+            features = data["features"]
+            return [
+                GalleryEntry(ids[i], names[i], features[i]) for i in range(len(ids))
+            ]
+        except Exception:
+            return None
+
+    def _save_cache(
+        self, cache_file: Path, fingerprint: str, entries: list[GalleryEntry]
+    ) -> None:
+        try:
+            self.np.savez(
+                cache_file,
+                fingerprint=fingerprint,
+                external_ids=self.np.array([e.external_id for e in entries]),
+                display_names=self.np.array([e.display_name for e in entries]),
+                features=self.np.stack([e.feature for e in entries]),
+            )
+        except Exception:
+            pass
 
     def match(self, face: DetectedFace) -> MatchDecision:
         candidates = [
             CandidateScore(
                 external_id=item.external_id,
                 display_name=item.display_name,
-                similarity=float(
-                    self.recognizer.match(
-                        face.feature,
-                        item.feature,
-                        self.cv2.FaceRecognizerSF_FR_COSINE,
-                    )
-                ),
+                similarity=self.similarity(face.feature, item.feature),
             )
             for item in self.gallery
         ]

@@ -2,7 +2,7 @@
 
 MVP para auditar eventos de entrada em salas críticas. Ele recebe o identificador reconhecido pela câmera, recupera pessoa, permissão, escala, sala, chamados e políticas, classifica o contexto com regras auditáveis, grava o log, gera PDF e enfileira alertas.
 
-O sistema **não controla a fechadura**. A API principal recebe um resultado de identidade (`user_id`) e metadados mínimos. Para a VIPC 1230 G2, que não possui reconhecimento embarcado, existe agora um worker local opcional com RTSP, YuNet/SFace, consenso em vários frames e confirmação visual de trajetória. Imagens e vetores biométricos não entram no webhook, nos PDFs ou no SQLite da API.
+O sistema **não controla a fechadura**. A API principal recebe um resultado de identidade (`user_id`) e metadados mínimos. Para a VIPC 1230 G2, que não possui reconhecimento embarcado, existe um worker local que reconhece quem passa pela porta com **InsightFace (RetinaFace + ArcFace)**, consenso em vários quadros e auto-aprendizado da base. Imagens e vetores biométricos não entram no webhook, nos PDFs ou no SQLite da API.
 
 ## O que já funciona
 
@@ -41,6 +41,66 @@ da porta.
 
 O roteiro completo para levar o projeto à rede real, incluindo o novo gatilho por e-mail com foto,
 está em [Plano de implantação no ambiente Intelbras](docs/plano-implantacao-ambiente-intelbras.md).
+
+## Reconhecimento facial na porta (fase de visão)
+
+Esta é a evolução implementada e em operação: o worker local reconhece **quem** passa pela porta comparando o rosto ao vivo com a base de fotos do controle de acesso — sem controlar a fechadura e sem enviar nenhuma imagem/vetor biométrico à API.
+
+### Tecnologia e bibliotecas
+
+- **InsightFace** (pacote `buffalo_l`), em CPU via **ONNX Runtime**:
+  - **RetinaFace** para detectar rostos.
+  - **ArcFace (ResNet-50, embedding de 512 dimensões)** para a "impressão digital" do rosto.
+- **OpenCV** para captura RTSP e imagem; **NumPy** para os vetores.
+- Similaridade por **cosseno**. O ArcFace separa muito bem as identidades (duas pessoas diferentes ficam perto de 0), o que permite um limiar baixo (~0,38) para **vencer o ângulo** da câmera de teto sem confundir pessoas. O YuNet/SFace do OpenCV foi a base inicial; a migração para ArcFace elevou a precisão e a robustez a ângulo.
+
+### Como funciona (fluxo do worker)
+
+```text
+RTSP (DVR Intelbras) → RetinaFace detecta os rostos do quadro
+  → ArcFace gera o embedding de cada rosto
+  → compara com a base (pessoas importadas do controle de acesso)
+  → consenso em vários quadros + margem entre 1º e 2º candidato
+  → regra de porta: só conta quem CHEGOU (se moveu na zona da porta)
+  → registra uma vez por visita (presença) → evento SEM imagem para a API
+  → salva a melhor foto (privada) + auto-aprende o ângulo da pessoa
+```
+
+### Modelo "reconhecido na porta"
+
+Como a porta tem fechadura eletrônica (quem não é autorizado nem abre), o momento de registrar é o **reconhecimento na porta** — não uma travessia direcional. O evento usa `entry_evidence=VISION_FACE_AT_DOOR` e `door_result=NOT_REPORTED` (a câmera não prova a liberação da fechadura). A contagem é precisa por três regras:
+
+- **Uma pessoa = um registro por visita** (presença): enquanto continua aparecendo não registra de novo; só reconta após ~5 s de ausência (saiu e voltou).
+- **Ignora quem está parado** (ex.: alguém sentado na direção da porta): só conta o rosto que **se move** ao entrar; fixos no enquadramento não viram registro.
+- **Múltiplas pessoas / carona**: cada pessoa é reconhecida e registrada separadamente, mesmo passando uma atrás da outra (o worker detecta a troca de identidade na trilha).
+
+### Auto-aprendizado da base
+
+Quando reconhece alguém com confiança (mas em um ângulo ainda não bem coberto), o worker guarda **só o embedding** (~2 KB) daquele rosto como nova referência da pessoa, nos ângulos reais da porta. A base fica mais precisa com o uso, **sem cadastrar rosto a rosto**. Travas de segurança: só aprende match confiante (0,50–0,85), qualidade mínima, no máximo 5 referências por pessoa, tudo auditável em `data/private/gallery/learned.db`. As referências aprendidas carregam instantâneas no restart (o conjunto base usa um cache de embeddings).
+
+### Evidência (foto) e privacidade
+
+A imagem **nunca** trafega no webhook nem entra no SQLite/PDF da auditoria. O worker salva, em armazenamento privado, a **cena completa** e um **recorte do rosto** (arquivos nomeados por hash), e o evento carrega apenas uma **referência opaca**. O painel exibe a foto atrás da autenticação de administrador.
+
+### Configurar e rodar a visão
+
+```powershell
+python -m pip install -e ".[vision]"   # numpy, opencv, onnxruntime, insightface
+# os modelos ArcFace/RetinaFace (buffalo_l) são baixados na primeira execução
+
+# importar a base de fotos do controle de acesso (ex.: ZIP do Intelbras InControl)
+python scripts\import_incontrol_gallery.py <origem> data\private\gallery
+python scripts\sync_gallery_people.py       # sincroniza nomes/IDs no banco de auditoria
+
+# testar câmera/RTSP e validar toda a cadeia
+python scripts\probe_intelbras_camera.py
+python scripts\run_vision_worker.py --check
+
+# operar (grava eventos com foto no painel; use RAG_AUDIT_VISION_DRY_RUN=false)
+python scripts\run_vision_worker.py
+```
+
+Limiar, qualidade, fps e parâmetros de aprendizado ficam no `.env` (veja `.env.example`). A base biométrica é dado pessoal sensível: trate `data/` como privado (ele fica fora do Git).
 
 ## Executar no Windows
 

@@ -162,7 +162,12 @@ def _filters(
 
 def _summary(event: dict) -> dict:
     excluded = {"raw_payload", "context_snapshot", "source_ids"}
-    return {key: value for key, value in event.items() if key not in excluded}
+    summary = {key: value for key, value in event.items() if key not in excluded}
+    payload = event.get("raw_payload")
+    summary["has_photo"] = bool(
+        isinstance(payload, dict) and payload.get("evidence_ref")
+    )
+    return summary
 
 
 def _webhook_receipt(event: dict, *, idempotent_replay: bool) -> dict:
@@ -461,6 +466,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if event is None:
             raise HTTPException(status_code=404, detail="Evento não encontrado.")
         return event
+
+    @application.get(
+        "/v1/access-events/{event_id}/photo",
+        include_in_schema=False,
+    )
+    async def access_event_photo(
+        event_id: str,
+        request: Request,
+        _admin: str = Depends(require_admin),
+        variant: str = Query(default="full"),
+    ) -> Response:
+        if variant not in {"full", "thumb"}:
+            raise HTTPException(status_code=422, detail="variant deve ser full ou thumb.")
+        event = await asyncio.to_thread(_repository(request).get_event, event_id)
+        if event is None:
+            raise HTTPException(status_code=404, detail="Evento não encontrado.")
+        payload = event.get("raw_payload") or {}
+        reference = payload.get("evidence_ref") if isinstance(payload, dict) else None
+        # Referência precisa ser exatamente um SHA-256 em hex: barra path traversal.
+        if (
+            not isinstance(reference, str)
+            or len(reference) != 64
+            or any(character not in "0123456789abcdef" for character in reference)
+        ):
+            raise HTTPException(status_code=404, detail="Evento sem foto associada.")
+        base = app_settings.evidence_dir.resolve()
+        candidates = (
+            [f"{reference}.thumb.jpg", f"{reference}.jpg"]
+            if variant == "thumb"
+            else [f"{reference}.jpg"]
+        )
+        photo_path = None
+        for filename in candidates:
+            candidate = (base / filename).resolve()
+            if candidate.parent == base and candidate.is_file():
+                photo_path = candidate
+                break
+        if photo_path is None:
+            raise HTTPException(status_code=404, detail="Foto indisponível.")
+        data = await asyncio.to_thread(photo_path.read_bytes)
+        return Response(
+            content=data,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=300"},
+        )
 
     @application.get("/v1/metrics", tags=["audit"])
     async def get_metrics(
