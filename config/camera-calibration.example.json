@@ -12,5 +12,9 @@
   "min_door_observations": 2,
   "min_inside_observations": 2,
   "track_timeout_seconds": 5,
-  "cooldown_seconds": 10
+  "cooldown_seconds": 10,
+  "line_deadband": 0.015,
+  "line_segment_margin": 0.05,
+  "min_crossing_displacement": 0.04,
+  "max_transition_seconds": 3
 }

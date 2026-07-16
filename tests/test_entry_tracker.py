@@ -157,6 +157,16 @@ def test_timeout_discards_partial_candidate_and_returns_expired_session() -> Non
     assert tracker.observe(observation("slow", 1.4, 0.5, 0.72)) is None
 
 
+def test_discard_restarts_partial_track_state() -> None:
+    tracker = EntryTracker(config())
+    tracker.observe(observation("handoff", 0.0, 0.5, 0.40))
+    tracker.observe(observation("handoff", 0.1, 0.5, 0.42))
+    tracker.discard("handoff")
+
+    assert tracker.observe(observation("handoff", 0.2, 0.5, 0.70)) is None
+    assert tracker.observe(observation("handoff", 0.3, 0.5, 0.72)) is None
+
+
 def test_cooldown_deduplicates_same_track_then_allows_a_new_session() -> None:
     tracker = EntryTracker(config(cooldown=timedelta(seconds=2)))
     first = None
@@ -210,6 +220,70 @@ def test_directed_line_requires_door_zone_persistence() -> None:
         tracker.observe(observation("wrong-door", index / 10, x, y)) is None
         for index, (x, y) in enumerate(path)
     )
+
+
+def test_directed_line_rejects_crossing_outside_segment() -> None:
+    with pytest.raises(ValueError, match="não cobre"):
+        config(
+            with_line=True,
+            door_zone=rectangle(0.80, 0.30, 0.98, 0.52),
+            inside_zone=rectangle(0.80, 0.50, 0.98, 0.95),
+        )
+
+
+def test_calibration_rejects_inverted_line_direction() -> None:
+    with pytest.raises(ValueError, match="door_zone"):
+        config(
+            with_line=True,
+            entry_line=DirectedLine(
+                Point(0.25, 0.50),
+                Point(0.75, 0.50),
+                "right",
+            ),
+        )
+
+
+def test_polygon_rejects_self_intersection() -> None:
+    with pytest.raises(ValueError, match="auto-intersectante"):
+        Polygon(
+            (
+                Point(0.1, 0.1),
+                Point(0.9, 0.1),
+                Point(0.2, 0.8),
+                Point(0.8, 0.8),
+                Point(0.5, 0.3),
+            )
+        )
+
+
+def test_directed_line_ignores_jitter_inside_deadband() -> None:
+    tracker = EntryTracker(
+        config(
+            with_line=True,
+            line_deadband=0.02,
+            min_inside_observations=1,
+        )
+    )
+    path = [(0.50, 0.40), (0.50, 0.42), (0.50, 0.495), (0.50, 0.505)]
+
+    assert all(
+        tracker.observe(observation("jitter", index / 10, x, y)) is None
+        for index, (x, y) in enumerate(path)
+    )
+
+
+def test_directed_line_rejects_slow_transition() -> None:
+    tracker = EntryTracker(
+        config(
+            with_line=True,
+            max_transition=timedelta(seconds=1),
+        )
+    )
+
+    assert tracker.observe(observation("slow-crossing", 0.0, 0.5, 0.40)) is None
+    assert tracker.observe(observation("slow-crossing", 0.1, 0.5, 0.42)) is None
+    assert tracker.observe(observation("slow-crossing", 1.2, 0.5, 0.60)) is None
+    assert tracker.observe(observation("slow-crossing", 1.3, 0.5, 0.70)) is None
 
 
 def test_geometry_uses_normalized_coordinates_and_includes_boundaries() -> None:

@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+load_dotenv(PROJECT_ROOT / ".env.api")
+load_dotenv(PROJECT_ROOT / ".env.vision")
 load_dotenv(PROJECT_ROOT / ".env")
 
 from app.database import Repository  # noqa: E402
@@ -32,11 +34,19 @@ def main() -> int:
             )
         ),
     )
-    args = parser.parse_args()
-    database_path = Path(
-        os.getenv("RAG_AUDIT_DB_PATH", str(PROJECT_ROOT / "data" / "rag_audit.db"))
+    parser.add_argument(
+        "--database",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "RAG_AUDIT_DB_PATH",
+                str(PROJECT_ROOT / "data" / "api" / "rag_audit.db"),
+            )
+        ),
+        help="banco SQLite da API",
     )
-    repository = Repository(database_path)
+    args = parser.parse_args()
+    repository = Repository(args.database)
     repository.initialize()
     try:
         count = sync_gallery_directory(args.manifest, repository)

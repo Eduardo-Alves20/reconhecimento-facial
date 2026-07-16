@@ -98,7 +98,8 @@ def test_calibration_loader_rejects_camera_mismatch(tmp_path) -> None:
 
 def test_processor_emits_once_after_same_face_moves_from_door_to_inside(tmp_path) -> None:
     class FakeEngine:
-        model_version = "fake-sface"
+        model_version = "fake-arcface"
+        model_fingerprint = "a" * 64
 
         def __init__(self) -> None:
             self.points = iter(((0.44, 0.5), (0.45, 0.5), (0.54, 0.5), (0.55, 0.5)))

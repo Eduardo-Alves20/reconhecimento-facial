@@ -53,6 +53,7 @@ _VISUAL_ENTRY_EVIDENCE = frozenset(
 class RecognitionSource(StrEnum):
     UNSPECIFIED = "UNSPECIFIED"
     LOCAL_SFACE = "LOCAL_SFACE"
+    LOCAL_ARCFACE = "LOCAL_ARCFACE"
     INTELBRAS = "INTELBRAS"
 
 
@@ -73,16 +74,22 @@ class AccessEventIn(BaseModel):
         default=None, min_length=1, max_length=100, pattern=IDENTIFIER_PATTERN
     )
     recognition_model: str | None = Field(default=None, min_length=1, max_length=100)
+    recognition_model_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{64}$",
+    )
     recognition_margin: float | None = Field(default=None, ge=0.0, le=2.0)
     face_quality: float | None = Field(default=None, ge=0.0, le=1.0)
     entry_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    # Referência opaca (SHA-256 em hex) para a foto guardada em armazenamento
-    # privado. A imagem em si nunca trafega no webhook.
+    # Identificador opaco da evidência privada.
     evidence_ref: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+    evidence_captured_at: datetime | None = None
 
-    @field_validator("timestamp")
+    @field_validator("timestamp", "evidence_captured_at")
     @classmethod
-    def timestamp_must_include_offset(cls, value: datetime) -> datetime:
+    def timestamp_must_include_offset(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("timestamp deve incluir o fuso/offset, por exemplo -03:00 ou Z")
         if not 2000 <= value.year <= 2100:
@@ -95,6 +102,52 @@ class AccessEventIn(BaseModel):
 
     @model_validator(mode="after")
     def visual_entry_has_honest_door_semantics(self) -> "AccessEventIn":
+        if self.evidence_ref is None and self.evidence_captured_at is not None:
+            raise ValueError(
+                "evidence_captured_at exige evidence_ref"
+            )
+        if (
+            self.evidence_captured_at is not None
+            and abs(
+                (
+                    self.evidence_captured_at.astimezone(UTC)
+                    - self.timestamp.astimezone(UTC)
+                ).total_seconds()
+            )
+            > 10
+        ):
+            raise ValueError(
+                "a captura da evidência deve estar próxima ao instante do evento"
+            )
+        if self.identity_status == IdentityStatus.UNKNOWN:
+            if not self.user_id.startswith("UNKNOWN:"):
+                raise ValueError(
+                    "identidade UNKNOWN deve usar um user_id iniciado por UNKNOWN:"
+                )
+            if self.recognition_confidence is not None:
+                raise ValueError(
+                    "identidade UNKNOWN não pode informar recognition_confidence"
+                )
+        elif self.identity_status == IdentityStatus.AMBIGUOUS:
+            if not self.user_id.startswith("AMBIGUOUS:"):
+                raise ValueError(
+                    "identidade AMBIGUOUS deve usar um user_id iniciado por AMBIGUOUS:"
+                )
+            if self.recognition_confidence is not None:
+                raise ValueError(
+                    "identidade AMBIGUOUS não pode informar recognition_confidence"
+                )
+        elif self.user_id.startswith(("UNKNOWN:", "AMBIGUOUS:")):
+            raise ValueError(
+                "identidade MATCHED não pode usar um identificador não resolvido"
+            )
+        if self.recognition_source == RecognitionSource.LOCAL_ARCFACE and (
+            self.recognition_model is None
+            or self.recognition_model_fingerprint is None
+        ):
+            raise ValueError(
+                "LOCAL_ARCFACE exige modelo e fingerprint verificado"
+            )
         if self.entry_evidence in _VISUAL_ENTRY_EVIDENCE:
             if self.door_result != DoorResult.NOT_REPORTED:
                 raise ValueError(

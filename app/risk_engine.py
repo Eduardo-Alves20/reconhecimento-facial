@@ -10,6 +10,7 @@ from .models import (
     EntryEvidence,
     Evaluation,
     IdentityStatus,
+    RecognitionSource,
     RiskLevel,
 )
 
@@ -81,6 +82,8 @@ def _is_qualifying_incident(
 def _event_action(event: AccessEventIn) -> str:
     if event.entry_evidence == EntryEvidence.VISION_LINE_CROSSING:
         return "teve a entrada observada pela câmera"
+    if event.entry_evidence == EntryEvidence.VISION_FACE_AT_DOOR:
+        return "foi observado próximo à porta"
     if event.door_result == DoorResult.GRANTED:
         return "teve a entrada liberada"
     if event.door_result == DoorResult.DENIED:
@@ -131,7 +134,11 @@ def evaluate_access(
         reason_codes.append("INACTIVE_PERSON")
         critical_identity_problem = True
 
-    if camera and event.recognition_confidence is not None:
+    if (
+        camera
+        and event.recognition_confidence is not None
+        and event.recognition_source != RecognitionSource.LOCAL_ARCFACE
+    ):
         if event.recognition_confidence < camera["recognition_threshold"]:
             reason_codes.append("LOW_RECOGNITION_CONFIDENCE")
             critical_identity_problem = True
@@ -249,9 +256,21 @@ def evaluate_access(
             "recognition_source": event.recognition_source.value,
             "track_id": event.track_id,
             "recognition_model": event.recognition_model,
+            **(
+                {
+                    "recognition_model_fingerprint": event.recognition_model_fingerprint
+                }
+                if event.recognition_model_fingerprint
+                else {}
+            ),
             "recognition_margin": event.recognition_margin,
             "face_quality": event.face_quality,
             "entry_confidence": event.entry_confidence,
+            "evidence_captured_at": (
+                event.evidence_captured_at.isoformat()
+                if event.evidence_captured_at
+                else None
+            ),
         },
         "qualifying_incidents": qualifying_incidents,
         "policies": [

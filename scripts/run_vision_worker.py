@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+load_dotenv(PROJECT_ROOT / ".env.vision")
 load_dotenv(PROJECT_ROOT / ".env")
 
 from app.vision.camera import probe_capture, probe_tcp  # noqa: E402
@@ -25,10 +26,16 @@ from app.vision.worker import (  # noqa: E402
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument(
         "--check",
         action="store_true",
-        help="valida câmera, modelos, galeria e calibração sem iniciar o monitoramento",
+        help="valida câmera, modelos, galeria e calibração",
+    )
+    checks.add_argument(
+        "--check-offline",
+        action="store_true",
+        help="valida modelos, galeria e calibração sem acessar a câmera",
     )
     args = parser.parse_args()
     try:
@@ -37,23 +44,25 @@ def main() -> int:
         print(f"Configuração incompleta: {exc}", file=sys.stderr)
         return 2
 
-    if args.check:
-        tcp = probe_tcp(settings.camera)
-        print(tcp.message)
-        if not tcp.ok:
-            return 1
-        capture = probe_capture(settings.camera)
-        print(capture.message)
-        if not capture.ok:
-            return 1
+    if args.check or args.check_offline:
+        if args.check:
+            tcp = probe_tcp(settings.camera)
+            print(tcp.message)
+            if not tcp.ok:
+                return 1
+            capture = probe_capture(settings.camera)
+            print(capture.message)
+            if not capture.ok:
+                return 1
         try:
             processor = create_processor(settings)
         except Exception as exc:
             print(f"Visão ainda não está pronta: {exc}", file=sys.stderr)
             return 1
+        people = {entry.external_id for entry in processor.engine.gallery}
         print(
-            f"Configuração validada; {len(processor.engine.gallery)} pessoa(s) "
-            "carregada(s) na galeria."
+            f"Configuração validada; {len(people)} pessoa(s) e "
+            f"{len(processor.engine.gallery)} referência(s) carregadas."
         )
         return 0
 
@@ -65,8 +74,8 @@ def main() -> int:
     except VisionConfigurationError as exc:
         print(f"Configuração inválida: {exc}", file=sys.stderr)
         return 2
-    except Exception as exc:
-        print(f"Worker interrompido com segurança: {exc}", file=sys.stderr)
+    except Exception:
+        print("Worker interrompido; os detalhes sensíveis foram omitidos.", file=sys.stderr)
         return 1
 
 
