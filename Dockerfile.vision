@@ -1,19 +1,74 @@
-FROM python:3.11-slim
+FROM python:3.11.13-slim-bookworm AS builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-build.txt requirements.txt requirements-vision.txt ./
+RUN python -m pip install --no-cache-dir -r requirements-build.txt \
+    && python -m pip wheel \
+        --no-build-isolation \
+        --prefer-binary \
+        --wheel-dir /wheels \
+        -r requirements-vision.txt
+
+COPY pyproject.toml README.md ./
+COPY app ./app
+RUN python -m pip wheel --no-deps --wheel-dir /wheels .
+
+
+FROM python:3.11.13-slim-bookworm
+
+ENV HOME=/home/rag-audit \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     RAG_AUDIT_VISION_MODELS_DIR=/app/vision-models
 
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libglib2.0-0 libgomp1 \
+    && apt-get install -y --no-install-recommends ca-certificates libglib2.0-0 libgomp1 tini \
+    && groupadd --system --gid 10001 rag-audit \
+    && useradd \
+        --system \
+        --uid 10001 \
+        --gid rag-audit \
+        --create-home \
+        --home-dir /home/rag-audit \
+        rag-audit \
+    && mkdir -p /app/data /app/vision-models \
+    && chown -R rag-audit:rag-audit /app /home/rag-audit \
     && rm -rf /var/lib/apt/lists/*
 
-COPY pyproject.toml README.md ./
-COPY app ./app
-COPY scripts ./scripts
-RUN python -m pip install --no-cache-dir ".[vision]" \
-    && python scripts/download_vision_models.py
+COPY --from=builder /wheels /wheels
+COPY requirements.txt requirements-vision.txt ./
+RUN python -m pip install \
+        --no-cache-dir \
+        --no-index \
+        --find-links=/wheels \
+        -r requirements-vision.txt \
+    && python -m pip install \
+        --no-cache-dir \
+        --no-index \
+        --no-deps \
+        --find-links=/wheels \
+        rag-audit==0.1.0 \
+    && rm -rf /wheels
 
-CMD ["python", "scripts/run_vision_worker.py"]
+COPY --chown=rag-audit:rag-audit \
+    scripts/manage_learned_gallery.py \
+    scripts/manage_vision_outbox.py \
+    scripts/run_vision_worker.py \
+    scripts/verify_vision_models.py \
+    ./scripts/
+
+USER 10001:10001
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-ec", "python scripts/verify_vision_models.py --root \"$RAG_AUDIT_VISION_MODELS_DIR\" --expected-fingerprint \"$RAG_AUDIT_VISION_MODEL_BUNDLE_SHA256\"; exec python scripts/run_vision_worker.py"]

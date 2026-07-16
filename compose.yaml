@@ -4,11 +4,20 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - .env.api
     environment:
-      RAG_AUDIT_DB_PATH: /app/data/rag_audit.db
+      RAG_AUDIT_DB_PATH: /app/data/api/rag_audit.db
+      RAG_AUDIT_VISION_EVIDENCE_DIR: /app/data/private/evidence
     volumes:
-      - ./data:/app/data
+      - ./data/api:/app/data/api
+      - ./data/private/evidence:/app/data/private/evidence
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
     healthcheck:
       test:
@@ -28,16 +37,30 @@ services:
       context: .
       dockerfile: Dockerfile.vision
     env_file:
-      - .env
+      - .env.vision
     environment:
       RAG_AUDIT_API_BASE_URL: http://rag-audit:8000
       RAG_AUDIT_VISION_MODELS_DIR: /app/vision-models
       RAG_AUDIT_GALLERY_MANIFEST: /app/data/private/gallery/manifest.json
-      RAG_AUDIT_CAMERA_CALIBRATION: /app/data/private/camera-calibration.json
-      RAG_AUDIT_VISION_OUTBOX_PATH: /app/data/private/vision-outbox.db
+      RAG_AUDIT_GALLERY_CACHE_PATH: /app/data/private/cache/{camera_id}/embeddings.arcface.npz
+      RAG_AUDIT_CAMERA_CALIBRATION: /app/data/private/config/camera-calibration.json
+      RAG_AUDIT_VISION_OUTBOX_PATH: /app/data/private/outbox/{camera_id}.db
+      RAG_AUDIT_VISION_DRY_RUN_OUTBOX_PATH: /app/data/private/outbox/{camera_id}.dry-run.db
+      RAG_AUDIT_VISION_EVIDENCE_DIR: /app/data/private/evidence
+      RAG_AUDIT_LEARNED_DB_PATH: /app/data/private/learned/learned.db
     volumes:
-      - ./data:/app/data
-    depends_on:
-      rag-audit:
-        condition: service_healthy
+      - ./data/private/gallery:/app/data/private/gallery:ro
+      - ./data/private/cache:/app/data/private/cache
+      - ./data/private/config:/app/data/private/config:ro
+      - ./data/private/outbox:/app/data/private/outbox
+      - ./data/private/evidence:/app/data/private/evidence
+      - ./data/private/learned:/app/data/private/learned
+      - ${RAG_AUDIT_VISION_MODELS_HOST_DIR:-./data/vision-models}:/app/vision-models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped

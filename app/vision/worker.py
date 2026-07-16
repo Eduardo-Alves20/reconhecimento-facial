@@ -1,36 +1,39 @@
-"""Worker RTSP: detecta rosto, confirma entrada e envia evento ao RAG-Audit."""
-
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
+import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
 from .camera import CameraConfig, build_rtsp_url
-from .entry_tracker import (
-    DirectedLine,
-    EntryConfirmation,
-    EntryTracker,
-    EntryTrackerConfig,
-    Point,
-    Polygon,
-    TrackObservation,
-)
-from .face_tracking import ConsensusResult, FaceCentroidTracker, IdentityConsensus
-from .identity import IDENTIFIER_RE, safe_person_id
+from .entry_tracker import DirectedLine, EntryTracker, EntryTrackerConfig, Point, Polygon
+from .evidence import EvidenceStore
+from .identity import safe_person_id
 from .learned import LearnedGallery
 from .outbox import VisionEventOutbox
-from .recognizer import ArcFaceEngine, MatchDecision, MatchStatus, MatchThresholds
+from .pipeline import (
+    ConsensusPolicy,
+    DetectionRegion,
+    DoorEventProcessor,
+    LearningPolicy,
+    VisionProcessor,
+    build_access_event,
+    build_door_event,
+)
+from .recognizer import ArcFaceEngine, FaceQualityPolicy, GalleryEntry, MatchThresholds
+
+
+_WORKER_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 
 class VisionConfigurationError(ValueError):
@@ -45,12 +48,24 @@ def _required_env(name: str) -> str:
 
 
 def _float_env(name: str, default: float, *, minimum: float, maximum: float) -> float:
-    raw = os.getenv(name, str(default))
+    raw = os.getenv(name, str(default)).strip()
     try:
         value = float(raw)
     except ValueError as exc:
         raise VisionConfigurationError(f"{name} deve ser numérico.") from exc
     if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise VisionConfigurationError(
+            f"{name} deve estar entre {minimum} e {maximum}."
+        )
+    return value
+
+
+def _int_env(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    if not re.fullmatch(r"[+-]?\d+", raw):
+        raise VisionConfigurationError(f"{name} deve ser inteiro.")
+    value = int(raw)
+    if not minimum <= value <= maximum:
         raise VisionConfigurationError(
             f"{name} deve estar entre {minimum} e {maximum}."
         )
@@ -69,6 +84,69 @@ def _bool_env(name: str, default: bool = False) -> bool:
     raise VisionConfigurationError(f"{name} deve ser true ou false.")
 
 
+def _path_env(name: str, default: Path, project_root: Path) -> Path:
+    raw = os.getenv(name)
+    value = str(default) if raw is None else raw.strip()
+    if not value:
+        raise VisionConfigurationError(f"{name} não pode ficar vazio.")
+    configured = Path(value)
+    return configured if configured.is_absolute() else (project_root / configured).resolve()
+
+
+def _camera_path_env(
+    name: str,
+    default: Path,
+    project_root: Path,
+    camera_id: str,
+) -> Path:
+    raw = os.getenv(name)
+    value = str(default) if raw is None else raw.strip()
+    try:
+        rendered = value.format(camera_id=camera_id)
+    except (KeyError, ValueError) as exc:
+        raise VisionConfigurationError(
+            f"{name} contém um placeholder inválido."
+        ) from exc
+    if "{" in rendered or "}" in rendered:
+        raise VisionConfigurationError(f"{name} contém um placeholder inválido.")
+    configured = Path(rendered)
+    return configured if configured.is_absolute() else (project_root / configured).resolve()
+
+
+def _providers_env() -> tuple[str, ...]:
+    raw = os.getenv("RAG_AUDIT_VISION_ONNX_PROVIDERS", "CPUExecutionProvider")
+    providers = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if (
+        not providers
+        or len(providers) > 4
+        or len(set(providers)) != len(providers)
+        or any(
+            len(provider) > 128
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*ExecutionProvider", provider)
+            for provider in providers
+        )
+    ):
+        raise VisionConfigurationError(
+            "RAG_AUDIT_VISION_ONNX_PROVIDERS contém um provider inválido."
+        )
+    return providers
+
+
+def _det_size_env() -> tuple[int, int]:
+    raw = os.getenv("RAG_AUDIT_VISION_DETECTION_SIZE", "640x640").strip().lower()
+    match = re.fullmatch(r"(\d{3,4})x(\d{3,4})", raw)
+    if match is None:
+        raise VisionConfigurationError(
+            "RAG_AUDIT_VISION_DETECTION_SIZE deve usar o formato 640x640."
+        )
+    width, height = (int(value) for value in match.groups())
+    if not 320 <= width <= 1920 or not 320 <= height <= 1920:
+        raise VisionConfigurationError(
+            "RAG_AUDIT_VISION_DETECTION_SIZE deve ficar entre 320 e 1920 pixels."
+        )
+    return width, height
+
+
 @dataclass(frozen=True, slots=True)
 class VisionWorkerSettings:
     camera: CameraConfig
@@ -78,99 +156,407 @@ class VisionWorkerSettings:
     api_key: str = field(repr=False)
     gallery_manifest: Path
     calibration_path: Path
-    detector_model: Path
-    recognizer_model: Path
+    models_dir: Path
+    model_fingerprint: str
     outbox_path: Path
     evidence_dir: Path
+    learned_path: Path
+    lease_path: Path | None = None
     sample_fps: float = 4.0
-    dry_run: bool = False
-    mode: str = "door"
-    min_door_frames: int = 3
+    dry_run: bool = True
+    mode: str = "entry"
+    allow_door_events: bool = False
+    min_door_frames: int = 4
+    roi_padding: float = 0.05
+    decision_wait_seconds: float = 1.5
+    evidence_ttl_days: int = 30
+    evidence_max_bytes: int = 10 * 1024 * 1024 * 1024
+    evidence_max_item_bytes: int = 25 * 1024 * 1024
+    evidence_evict_oldest: bool = True
+    outbox_sent_retention_days: int = 30
     thresholds: MatchThresholds = MatchThresholds()
+    quality_policy: FaceQualityPolicy = FaceQualityPolicy()
+    consensus_policy: ConsensusPolicy = ConsensusPolicy()
+    learning_policy: LearningPolicy = LearningPolicy()
+    providers: tuple[str, ...] = ("CPUExecutionProvider",)
+    detection_size: tuple[int, int] = (640, 640)
+    learn_max_per_person: int = 5
+    learned_refresh_seconds: int = 15
+    gallery_cache_path: Path | None = None
+    dry_run_save_evidence: bool = False
+    dry_run_outbox_retention_days: int = 7
+    dry_run_outbox_max_events: int = 10_000
+
+    def __post_init__(self) -> None:
+        if not _WORKER_IDENTIFIER_RE.fullmatch(
+            self.camera_id
+        ) or not _WORKER_IDENTIFIER_RE.fullmatch(self.room_id):
+            raise VisionConfigurationError("IDs de câmera/sala possuem formato inválido.")
+        if self.mode not in {"entry", "door"}:
+            raise VisionConfigurationError("RAG_AUDIT_VISION_MODE deve ser entry ou door.")
+        if self.mode == "door" and not self.dry_run and not self.allow_door_events:
+            raise VisionConfigurationError(
+                "O modo door é apenas observacional. Para publicar esses eventos, "
+                "defina RAG_AUDIT_VISION_ALLOW_DOOR_EVENTS=true de forma consciente."
+            )
+        fingerprint = self.model_fingerprint.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise VisionConfigurationError(
+                "RAG_AUDIT_VISION_MODEL_BUNDLE_SHA256 deve ser um SHA-256 válido."
+            )
+        if self.evidence_max_item_bytes > self.evidence_max_bytes:
+            raise VisionConfigurationError(
+                "O limite por evidência não pode superar a cota total."
+            )
+        if not 5 <= self.learned_refresh_seconds <= 3600:
+            raise VisionConfigurationError(
+                "O intervalo de recarga aprendida deve ficar entre 5 e 3600 segundos."
+            )
+        if not 1 <= self.dry_run_outbox_retention_days <= 365:
+            raise VisionConfigurationError(
+                "A retenção da outbox de dry-run deve ficar entre 1 e 365 dias."
+            )
+        if not 100 <= self.dry_run_outbox_max_events <= 1_000_000:
+            raise VisionConfigurationError(
+                "O limite da outbox de dry-run deve ficar entre 100 e 1000000 eventos."
+            )
+        object.__setattr__(self, "model_fingerprint", fingerprint)
 
     @classmethod
     def from_env(cls, project_root: Path) -> "VisionWorkerSettings":
-        model_dir = Path(
-            os.getenv(
-                "RAG_AUDIT_VISION_MODELS_DIR",
-                str(project_root / "data" / "vision-models"),
-            )
-        )
-        api_base_url = os.getenv("RAG_AUDIT_API_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+        api_base_url = os.getenv(
+            "RAG_AUDIT_API_BASE_URL",
+            "http://127.0.0.1:8000",
+        ).strip().rstrip("/")
         parsed = urlparse(api_base_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username:
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
             raise VisionConfigurationError("RAG_AUDIT_API_BASE_URL é inválida.")
+
         camera_id = os.getenv("RAG_AUDIT_VISION_CAMERA_ID", "cam-ti-01").strip()
         room_id = os.getenv("RAG_AUDIT_VISION_ROOM_ID", "sala_ti_01").strip()
-        if not IDENTIFIER_RE.fullmatch(camera_id) or not IDENTIFIER_RE.fullmatch(room_id):
+        if not _WORKER_IDENTIFIER_RE.fullmatch(
+            camera_id
+        ) or not _WORKER_IDENTIFIER_RE.fullmatch(room_id):
             raise VisionConfigurationError("IDs de câmera/sala possuem formato inválido.")
-        try:
-            camera_port = int(os.getenv("INTELBRAS_CAMERA_RTSP_PORT", "554"))
-            camera_channel = int(os.getenv("INTELBRAS_CAMERA_CHANNEL", "1"))
-            camera_subtype = int(os.getenv("INTELBRAS_CAMERA_SUBTYPE", "0"))
-        except ValueError as exc:
-            raise VisionConfigurationError("Porta, canal e subtipo da câmera devem ser inteiros.") from exc
+
         camera = CameraConfig(
             host=_required_env("INTELBRAS_CAMERA_HOST"),
             username=_required_env("INTELBRAS_CAMERA_USER"),
             password=_required_env("INTELBRAS_CAMERA_PASSWORD"),
-            port=camera_port,
-            channel=camera_channel,
-            subtype=camera_subtype,
+            port=_int_env("INTELBRAS_CAMERA_RTSP_PORT", 554, minimum=1, maximum=65_535),
+            channel=_int_env("INTELBRAS_CAMERA_CHANNEL", 1, minimum=1, maximum=64),
+            subtype=_int_env("INTELBRAS_CAMERA_SUBTYPE", 0, minimum=0, maximum=1),
             timeout_seconds=_float_env(
-                "INTELBRAS_CAMERA_TIMEOUT_SECONDS", 5.0, minimum=0.1, maximum=60
+                "INTELBRAS_CAMERA_TIMEOUT_SECONDS",
+                5.0,
+                minimum=0.1,
+                maximum=60,
             ),
         )
+        private_root = project_root / "data" / "private"
+        gallery_manifest = _path_env(
+            "RAG_AUDIT_GALLERY_MANIFEST",
+            private_root / "gallery" / "manifest.json",
+            project_root,
+        )
+        mode = os.getenv("RAG_AUDIT_VISION_MODE", "entry").strip().lower() or "entry"
+        dry_run = _bool_env("RAG_AUDIT_VISION_DRY_RUN", True)
+        production_outbox = _camera_path_env(
+            "RAG_AUDIT_VISION_OUTBOX_PATH",
+            private_root / "outbox" / f"{camera_id}.db",
+            project_root,
+            camera_id,
+        )
+        dry_run_outbox = _camera_path_env(
+            "RAG_AUDIT_VISION_DRY_RUN_OUTBOX_PATH",
+            private_root / "outbox" / f"{camera_id}.dry-run.db",
+            project_root,
+            camera_id,
+        )
+        if production_outbox == dry_run_outbox:
+            raise VisionConfigurationError(
+                "As outboxes de dry-run e produção precisam ser diferentes."
+            )
+        if camera_id not in str(production_outbox) or camera_id not in str(
+            dry_run_outbox
+        ):
+            raise VisionConfigurationError(
+                "Os caminhos de outbox precisam incluir o camera_id."
+            )
+        gallery_cache_path = _camera_path_env(
+            "RAG_AUDIT_GALLERY_CACHE_PATH",
+            private_root / "cache" / camera_id / "embeddings.arcface.npz",
+            project_root,
+            camera_id,
+        )
+        if camera_id not in str(gallery_cache_path):
+            raise VisionConfigurationError(
+                "O caminho do cache da galeria precisa incluir o camera_id."
+            )
         return cls(
             camera=camera,
             camera_id=camera_id,
             room_id=room_id,
             api_base_url=api_base_url,
             api_key=_required_env("RAG_AUDIT_CAMERA_API_KEY"),
-            gallery_manifest=Path(
-                os.getenv(
-                    "RAG_AUDIT_GALLERY_MANIFEST",
-                    str(project_root / "data" / "private" / "gallery" / "manifest.json"),
-                )
+            gallery_manifest=gallery_manifest,
+            gallery_cache_path=gallery_cache_path,
+            calibration_path=_path_env(
+                "RAG_AUDIT_CAMERA_CALIBRATION",
+                private_root / "camera-calibration.json",
+                project_root,
             ),
-            calibration_path=Path(
-                os.getenv(
-                    "RAG_AUDIT_CAMERA_CALIBRATION",
-                    str(project_root / "data" / "private" / "camera-calibration.json"),
-                )
+            models_dir=_path_env(
+                "RAG_AUDIT_VISION_MODELS_DIR",
+                project_root / "data" / "vision-models",
+                project_root,
             ),
-            detector_model=model_dir / "face_detection_yunet_2023mar.onnx",
-            recognizer_model=model_dir / "face_recognition_sface_2021dec.onnx",
-            outbox_path=Path(
-                os.getenv(
-                    "RAG_AUDIT_VISION_OUTBOX_PATH",
-                    str(project_root / "data" / "private" / "vision-outbox.db"),
-                )
+            model_fingerprint=_required_env(
+                "RAG_AUDIT_VISION_MODEL_BUNDLE_SHA256"
             ),
-            evidence_dir=Path(
-                os.getenv(
-                    "RAG_AUDIT_VISION_EVIDENCE_DIR",
-                    str(project_root / "data" / "private" / "evidence"),
-                )
+            outbox_path=dry_run_outbox if dry_run else production_outbox,
+            evidence_dir=_path_env(
+                "RAG_AUDIT_VISION_EVIDENCE_DIR",
+                private_root / "evidence",
+                project_root,
             ),
+            learned_path=_path_env(
+                "RAG_AUDIT_LEARNED_DB_PATH",
+                gallery_manifest.parent / "learned.db",
+                project_root,
+            ),
+            lease_path=production_outbox,
             sample_fps=_float_env(
-                "RAG_AUDIT_VISION_SAMPLE_FPS", 4.0, minimum=0.5, maximum=15.0
+                "RAG_AUDIT_VISION_SAMPLE_FPS",
+                4.0,
+                minimum=0.5,
+                maximum=15.0,
             ),
-            dry_run=_bool_env("RAG_AUDIT_VISION_DRY_RUN", False),
-            mode=(os.getenv("RAG_AUDIT_VISION_MODE", "door").strip().lower() or "door"),
-            min_door_frames=int(
-                _float_env("RAG_AUDIT_VISION_MIN_DOOR_FRAMES", 3, minimum=1, maximum=30)
+            dry_run=dry_run,
+            mode=mode,
+            allow_door_events=_bool_env(
+                "RAG_AUDIT_VISION_ALLOW_DOOR_EVENTS",
+                False,
+            ),
+            min_door_frames=_int_env(
+                "RAG_AUDIT_VISION_MIN_DOOR_FRAMES",
+                4,
+                minimum=1,
+                maximum=30,
+            ),
+            roi_padding=_float_env(
+                "RAG_AUDIT_VISION_ROI_PADDING",
+                0.05,
+                minimum=0,
+                maximum=0.5,
+            ),
+            decision_wait_seconds=_float_env(
+                "RAG_AUDIT_VISION_DECISION_WAIT_SECONDS",
+                1.5,
+                minimum=0,
+                maximum=5,
+            ),
+            evidence_ttl_days=_int_env(
+                "RAG_AUDIT_EVIDENCE_TTL_DAYS",
+                30,
+                minimum=1,
+                maximum=3650,
+            ),
+            evidence_max_bytes=round(
+                _float_env(
+                    "RAG_AUDIT_EVIDENCE_MAX_GB",
+                    10,
+                    minimum=0.1,
+                    maximum=10_000,
+                )
+                * 1024
+                * 1024
+                * 1024
+            ),
+            evidence_max_item_bytes=round(
+                _float_env(
+                    "RAG_AUDIT_EVIDENCE_MAX_ITEM_MB",
+                    25,
+                    minimum=1,
+                    maximum=500,
+                )
+                * 1024
+                * 1024
+            ),
+            evidence_evict_oldest=_bool_env(
+                "RAG_AUDIT_EVIDENCE_EVICT_OLDEST",
+                True,
+            ),
+            outbox_sent_retention_days=_int_env(
+                "RAG_AUDIT_VISION_OUTBOX_SENT_RETENTION_DAYS",
+                30,
+                minimum=1,
+                maximum=3650,
             ),
             thresholds=MatchThresholds(
                 similarity=_float_env(
-                    "RAG_AUDIT_FACE_SIMILARITY_THRESHOLD", 0.55, minimum=0, maximum=1
+                    "RAG_AUDIT_FACE_SIMILARITY_THRESHOLD",
+                    0.55,
+                    minimum=0,
+                    maximum=1,
                 ),
                 margin=_float_env(
-                    "RAG_AUDIT_FACE_MARGIN_THRESHOLD", 0.08, minimum=0, maximum=1
+                    "RAG_AUDIT_FACE_MARGIN_THRESHOLD",
+                    0.10,
+                    minimum=0,
+                    maximum=1,
                 ),
                 face_quality=_float_env(
-                    "RAG_AUDIT_FACE_QUALITY_THRESHOLD", 0.40, minimum=0, maximum=1
+                    "RAG_AUDIT_FACE_QUALITY_THRESHOLD",
+                    0.50,
+                    minimum=0,
+                    maximum=1,
                 ),
+            ),
+            quality_policy=FaceQualityPolicy(
+                min_inter_eye_pixels=_float_env(
+                    "RAG_AUDIT_FACE_MIN_INTER_EYE_PIXELS",
+                    40,
+                    minimum=10,
+                    maximum=300,
+                ),
+                full_inter_eye_pixels=_float_env(
+                    "RAG_AUDIT_FACE_FULL_INTER_EYE_PIXELS",
+                    80,
+                    minimum=20,
+                    maximum=500,
+                ),
+                min_focus_variance=_float_env(
+                    "RAG_AUDIT_FACE_MIN_FOCUS_VARIANCE",
+                    20,
+                    minimum=1,
+                    maximum=1000,
+                ),
+                full_focus_variance=_float_env(
+                    "RAG_AUDIT_FACE_FULL_FOCUS_VARIANCE",
+                    260,
+                    minimum=2,
+                    maximum=5000,
+                ),
+                max_pitch_degrees=_float_env(
+                    "RAG_AUDIT_FACE_MAX_PITCH_DEGREES",
+                    25,
+                    minimum=1,
+                    maximum=90,
+                ),
+                max_yaw_degrees=_float_env(
+                    "RAG_AUDIT_FACE_MAX_YAW_DEGREES",
+                    35,
+                    minimum=1,
+                    maximum=90,
+                ),
+                max_roll_degrees=_float_env(
+                    "RAG_AUDIT_FACE_MAX_ROLL_DEGREES",
+                    25,
+                    minimum=1,
+                    maximum=90,
+                ),
+            ),
+            consensus_policy=ConsensusPolicy(
+                history_size=_int_env(
+                    "RAG_AUDIT_CONSENSUS_HISTORY_SIZE",
+                    12,
+                    minimum=4,
+                    maximum=120,
+                ),
+                minimum_matches=_int_env(
+                    "RAG_AUDIT_CONSENSUS_MIN_MATCHES",
+                    4,
+                    minimum=2,
+                    maximum=60,
+                ),
+                minimum_ratio=_float_env(
+                    "RAG_AUDIT_CONSENSUS_MIN_RATIO",
+                    0.70,
+                    minimum=0.5,
+                    maximum=1,
+                ),
+                minimum_consecutive=_int_env(
+                    "RAG_AUDIT_CONSENSUS_MIN_CONSECUTIVE",
+                    3,
+                    minimum=1,
+                    maximum=30,
+                ),
+            ),
+            learning_policy=LearningPolicy(
+                enabled=_bool_env("RAG_AUDIT_LEARN_ENABLED", False),
+                allow_dry_run=_bool_env(
+                    "RAG_AUDIT_LEARN_ALLOW_DRY_RUN",
+                    False,
+                ),
+                min_similarity=_float_env(
+                    "RAG_AUDIT_LEARN_MIN_SIMILARITY",
+                    0.65,
+                    minimum=0,
+                    maximum=1,
+                ),
+                max_similarity=_float_env(
+                    "RAG_AUDIT_LEARN_MAX_SIMILARITY",
+                    0.95,
+                    minimum=0,
+                    maximum=1,
+                ),
+                min_margin=_float_env(
+                    "RAG_AUDIT_LEARN_MIN_MARGIN",
+                    0.12,
+                    minimum=0,
+                    maximum=1,
+                ),
+                min_quality=_float_env(
+                    "RAG_AUDIT_LEARN_MIN_QUALITY",
+                    0.60,
+                    minimum=0,
+                    maximum=1,
+                ),
+                min_supporting_frames=_int_env(
+                    "RAG_AUDIT_LEARN_MIN_SUPPORTING_FRAMES",
+                    4,
+                    minimum=2,
+                    maximum=60,
+                ),
+            ),
+            providers=_providers_env(),
+            detection_size=_det_size_env(),
+            learn_max_per_person=_int_env(
+                "RAG_AUDIT_LEARN_MAX_PER_PERSON",
+                5,
+                minimum=1,
+                maximum=50,
+            ),
+            learned_refresh_seconds=_int_env(
+                "RAG_AUDIT_LEARN_REFRESH_SECONDS",
+                15,
+                minimum=5,
+                maximum=3600,
+            ),
+            dry_run_save_evidence=_bool_env(
+                "RAG_AUDIT_VISION_DRY_RUN_SAVE_EVIDENCE",
+                False,
+            ),
+            dry_run_outbox_retention_days=_int_env(
+                "RAG_AUDIT_VISION_DRY_RUN_OUTBOX_RETENTION_DAYS",
+                7,
+                minimum=1,
+                maximum=365,
+            ),
+            dry_run_outbox_max_events=_int_env(
+                "RAG_AUDIT_VISION_DRY_RUN_OUTBOX_MAX_EVENTS",
+                10_000,
+                minimum=100,
+                maximum=1_000_000,
             ),
         )
 
@@ -182,7 +568,10 @@ def _point(value: Any) -> Point:
 
 
 def load_entry_tracker_config(
-    path: str | Path, *, camera_id: str, room_id: str
+    path: str | Path,
+    *,
+    camera_id: str,
+    room_id: str,
 ) -> EntryTrackerConfig:
     calibration_path = Path(path)
     try:
@@ -191,9 +580,9 @@ def load_entry_tracker_config(
         raise VisionConfigurationError(
             f"Calibração ausente: {calibration_path}."
         ) from exc
-    except (OSError, ValueError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise VisionConfigurationError("Arquivo de calibração inválido.") from exc
-    if payload.get("schema_version") != 1:
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise VisionConfigurationError("Versão de calibração não suportada.")
     if payload.get("camera_id") != camera_id or payload.get("room_id") != room_id:
         raise VisionConfigurationError("A calibração pertence a outra câmera ou sala.")
@@ -218,458 +607,61 @@ def load_entry_tracker_config(
             entry_line=entry_line,
             min_door_observations=int(payload.get("min_door_observations", 2)),
             min_inside_observations=int(payload.get("min_inside_observations", 2)),
-            track_timeout=timedelta(seconds=float(payload.get("track_timeout_seconds", 5))),
-            cooldown=timedelta(seconds=float(payload.get("cooldown_seconds", 10))),
+            track_timeout=timedelta(
+                seconds=float(payload.get("track_timeout_seconds", 5))
+            ),
+            cooldown=timedelta(
+                seconds=float(payload.get("cooldown_seconds", 10))
+            ),
+            line_deadband=float(payload.get("line_deadband", 0.015)),
+            line_segment_margin=float(payload.get("line_segment_margin", 0.05)),
+            min_crossing_displacement=float(
+                payload.get("min_crossing_displacement", 0.04)
+            ),
+            max_transition=timedelta(
+                seconds=float(payload.get("max_transition_seconds", 3))
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise VisionConfigurationError(f"Geometria de calibração inválida: {exc}") from exc
-
-
-def build_access_event(
-    confirmation: EntryConfirmation,
-    consensus: ConsensusResult,
-    *,
-    model_version: str,
-) -> dict[str, Any]:
-    if consensus.status == MatchStatus.MATCHED and consensus.external_id:
-        user_id = safe_person_id(consensus.external_id)
-        identity_status = "MATCHED"
-        confidence = max(0.0, min(1.0, consensus.similarity or 0.0))
-    elif consensus.status == MatchStatus.AMBIGUOUS:
-        user_id = f"AMBIGUOUS:{confirmation.session_id}"
-        identity_status = "AMBIGUOUS"
-        confidence = None
-    else:
-        user_id = f"UNKNOWN:{confirmation.session_id}"
-        identity_status = "UNKNOWN"
-        confidence = None
-    return {
-        "event_id": f"entry:{confirmation.session_id}",
-        "camera_id": confirmation.camera_id,
-        "user_id": user_id,
-        "room_id": confirmation.room_id,
-        "timestamp": confirmation.confirmed_at.isoformat(),
-        "door_result": "NOT_REPORTED",
-        "recognition_confidence": confidence,
-        "identity_status": identity_status,
-        "entry_evidence": "VISION_LINE_CROSSING",
-        "recognition_source": "LOCAL_SFACE",
-        "track_id": confirmation.track_id,
-        "recognition_model": model_version,
-        "recognition_margin": consensus.margin,
-        "face_quality": consensus.face_quality,
-        "entry_confidence": min(1.0, confirmation.observation_count / 6.0),
-    }
-
-
-def _crop_face(frame: Any, face: Any, *, margin: float) -> Any | None:
-    """Recorta o rosto com margem proporcional; ``None`` se inviável."""
-
-    try:
-        height, width = frame.shape[:2]
-        x, y, box_width, box_height = (int(value) for value in face.bbox)
-        margin_x = int(box_width * margin)
-        margin_y = int(box_height * margin)
-        x1 = max(0, x - margin_x)
-        y1 = max(0, y - margin_y)
-        x2 = min(width, x + box_width + margin_x)
-        y2 = min(height, y + box_height + margin_y)
-        crop = frame[y1:y2, x1:x2]
-        return crop if crop.size else None
-    except Exception:
-        return None
-
-
-def _write_jpeg(cv2: Any, image: Any, destination: Path, quality: int) -> bool:
-    ok, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ok:
-        return False
-    if not destination.exists():
-        temporary = destination.with_suffix(destination.suffix + ".tmp")
-        temporary.write_bytes(buffer.tobytes())
-        os.replace(temporary, destination)
-    return True
-
-
-def save_evidence(cv2: Any, frame: Any, face: Any, evidence_dir: Path) -> str | None:
-    """Guarda a cena completa e um recorte do rosto em armazenamento privado.
-
-    Devolve o SHA-256 da cena completa como referência opaca; a imagem nunca
-    trafega pelo webhook. O recorte fica em ``<sha>.thumb.jpg`` para a lista.
-    """
-
-    try:
-        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        if not ok:
-            return None
-        data = buffer.tobytes()
-        digest = hashlib.sha256(data).hexdigest()
-        evidence_dir.mkdir(parents=True, exist_ok=True)
-        full_path = evidence_dir / f"{digest}.jpg"
-        if not full_path.exists():
-            temporary = full_path.with_suffix(".jpg.tmp")
-            temporary.write_bytes(data)
-            os.replace(temporary, full_path)
-        crop = _crop_face(frame, face, margin=0.6)
-        if crop is not None:
-            _write_jpeg(cv2, crop, evidence_dir / f"{digest}.thumb.jpg", 88)
-        return digest
-    except Exception:
-        return None
-
-
-def build_door_event(
-    *,
-    session_id: str,
-    track_id: str,
-    camera_id: str,
-    room_id: str,
-    consensus: ConsensusResult,
-    model_version: str,
-    evidence_ref: str | None,
-    confirmed_at: datetime,
-    observation_count: int,
-) -> dict[str, Any]:
-    """Evento de 'rosto reconhecido na porta' (sem prova de direção)."""
-
-    if consensus.status == MatchStatus.MATCHED and consensus.external_id:
-        user_id = safe_person_id(consensus.external_id)
-        identity_status = "MATCHED"
-        confidence = max(0.0, min(1.0, consensus.similarity or 0.0))
-    elif consensus.status == MatchStatus.AMBIGUOUS:
-        user_id = f"AMBIGUOUS:{session_id}"
-        identity_status = "AMBIGUOUS"
-        confidence = None
-    else:
-        user_id = f"UNKNOWN:{session_id}"
-        identity_status = "UNKNOWN"
-        confidence = None
-    payload: dict[str, Any] = {
-        "event_id": f"entry:{session_id}",
-        "camera_id": camera_id,
-        "user_id": user_id,
-        "room_id": room_id,
-        "timestamp": confirmed_at.isoformat(),
-        "door_result": "NOT_REPORTED",
-        "recognition_confidence": confidence,
-        "identity_status": identity_status,
-        "entry_evidence": "VISION_FACE_AT_DOOR",
-        "recognition_source": "LOCAL_SFACE",
-        "track_id": track_id,
-        "recognition_model": model_version,
-        "recognition_margin": consensus.margin,
-        "face_quality": consensus.face_quality,
-        "entry_confidence": min(1.0, observation_count / 6.0),
-    }
-    if evidence_ref:
-        payload["evidence_ref"] = evidence_ref
-    return payload
-
-
-class DoorEventProcessor:
-    """Registra o acesso quando um rosto persiste na zona da porta.
-
-    Não tenta provar direção (entrar/sair). Como a porta tem fechadura, quem é
-    reconhecido ali é quem está acessando. Guarda a melhor foto do rosto e
-    enfileira o evento uma única vez por presença.
-    """
-
-    def __init__(
-        self,
-        engine: "RecognitionEngine",
-        door_zone: Polygon,
-        outbox: VisionEventOutbox,
-        *,
-        camera_id: str,
-        room_id: str,
-        evidence_dir: Path,
-        min_door_frames: int = 3,
-        cooldown: timedelta = timedelta(seconds=15),
-        learned: LearnedGallery | None = None,
-        learn_min_similarity: float = 0.50,
-        learn_max_similarity: float = 0.85,
-        learn_min_quality: float = 0.50,
-    ) -> None:
-        self.engine = engine
-        self.door_zone = door_zone
-        self.outbox = outbox
-        self.camera_id = camera_id
-        self.room_id = room_id
-        self.evidence_dir = evidence_dir
-        self.min_door_frames = min_door_frames
-        self.cooldown = cooldown
-        # Auto-aprendizado: aprende novas referências das pessoas reconhecidas.
-        self.learned = learned
-        self.learn_min_similarity = learn_min_similarity
-        self.learn_max_similarity = learn_max_similarity
-        self.learn_min_quality = learn_min_quality
-        self.cv2 = engine.cv2  # type: ignore[attr-defined]
-        # Mantém a mesma trilha viva por alguns segundos mesmo se o rosto some
-        # por um instante (a pessoa vira a cabeça), para acumular vários ângulos
-        # numa passagem só. Histórico maior guarda mais ângulos para a decisão.
-        self.face_tracker = FaceCentroidTracker(max_age=timedelta(seconds=4))
-        # ArcFace separa bem (errado ~0,00), então 2 quadros já bastam — ajuda a
-        # reconhecer quem aparece por poucos quadros (a pessoa de trás).
-        self.consensus = IdentityConsensus(history_size=30, minimum_matches=2)
-        self._known: set[str] = set()
-        self._door_hits: dict[str, int] = {}
-        self._best: dict[str, tuple[float, Any, Any]] = {}
-        self._last_seen: dict[str, datetime] = {}
-        # Trilhas que já registraram alguém reconhecido (para não emitir também
-        # um 'desconhecido' no fim). Uma trilha pode registrar mais de uma pessoa.
-        self._track_matched: set[str] = set()
-        # Presença: enquanto a pessoa continua aparecendo não registra de novo;
-        # só reconta após ausência (saiu e voltou = nova entrada).
-        self._present_until: dict[str, datetime] = {}
-        self._absence_gap = timedelta(seconds=5)
-        # Movimento por trilha: só conta quem CHEGOU (se moveu na porta), não quem
-        # está parado no enquadramento (ex.: pessoa sentada na direção da porta).
-        self._track_origin: dict[str, tuple[float, float]] = {}
-        self._track_moved: set[str] = set()
-        # Desconhecidos recentes (instante, embedding) para deduplicar por rosto.
-        self._recent_unknowns: list[tuple[datetime, Any]] = []
-        self._last_log: datetime | None = None
-
-    def process_frame(self, frame: Any, observed_at: datetime) -> list[dict[str, Any]]:
-        emitted: list[dict[str, Any]] = []
-        faces = self.engine.detect(frame)
-        frame_log: list[str] = []
-        for tracked in self.face_tracker.update(faces, observed_at):
-            track_id = tracked.track_id
-            self._known.add(track_id)
-            decision = self.engine.match(tracked.face)
-            # Se outra pessoa confiável assumiu a mesma trilha (carona: o de trás
-            # ocupa o lugar do da frente), zera o consenso para ela não ser
-            # absorvida pela identidade anterior.
-            if decision.status == MatchStatus.MATCHED and decision.external_id:
-                current = self.consensus.resolve(track_id)
-                if (
-                    current.status == MatchStatus.MATCHED
-                    and current.external_id
-                    and current.external_id != decision.external_id
-                ):
-                    self.consensus.discard(track_id)
-                    self._track_matched.discard(track_id)
-            self.consensus.add(track_id, decision)
-            cx, cy = tracked.face.centroid
-            in_door = self.door_zone.contains(Point(cx, cy))
-            who = decision.display_name or decision.status.value
-            frame_log.append(
-                f"({cx:.2f},{cy:.2f}){'PORTA' if in_door else 'fora'}:"
-                f"{who[:16]} q{tracked.face.quality:.2f}"
-            )
-            if not in_door:
-                continue
-            self._door_hits[track_id] = self._door_hits.get(track_id, 0) + 1
-            self._last_seen[track_id] = observed_at
-            # Marca a trilha como "chegou" quando o rosto se desloca na porta;
-            # quem fica parado (sentado) nunca é marcado e não vira entrada.
-            origin = self._track_origin.setdefault(track_id, (cx, cy))
-            if track_id not in self._track_moved and (
-                abs(cx - origin[0]) + abs(cy - origin[1]) > 0.05
-            ):
-                self._track_moved.add(track_id)
-            quality = tracked.face.quality
-            if track_id not in self._best or quality > self._best[track_id][0]:
-                # Guarda o melhor quadro na memória; grava só ao decidir.
-                self._best[track_id] = (quality, frame.copy(), tracked.face)
-            if self._door_hits[track_id] < self.min_door_frames:
-                continue
-            result = self.consensus.resolve(track_id)
-            if result.status == MatchStatus.MATCHED and result.external_id:
-                previous = self._present_until.get(result.external_id)
-                still_present = previous is not None and observed_at < previous
-                if still_present:
-                    # Já registrada nesta visita: só mantém a presença viva
-                    # (para não recontar enquanto a pessoa continua na sala).
-                    self._present_until[result.external_id] = (
-                        observed_at + self._absence_gap
-                    )
-                elif track_id in self._track_moved:
-                    # Chegou (se moveu na porta) e não está presente: registra
-                    # e só ENTÃO marca presença. Marcar antes de registrar
-                    # bloqueava a própria entrada.
-                    payload = self._emit_decision(track_id, observed_at, result)
-                    if payload is not None:
-                        self._present_until[result.external_id] = (
-                            observed_at + self._absence_gap
-                        )
-                        self._track_matched.add(track_id)
-                        emitted.append(payload)
-        # Log throttled do que a câmera vê, para diagnóstico ao vivo.
-        if faces and (
-            self._last_log is None
-            or (observed_at - self._last_log).total_seconds() >= 1.5
-        ):
-            self._last_log = observed_at
-            print(f"[visao] {len(faces)} rosto(s): {frame_log}", flush=True)
-        emitted.extend(self._flush_expired(observed_at))
-        return emitted
-
-    def _same_recent_unknown(self, feature: Any, observed_at: datetime) -> bool:
-        """Verdadeiro se este rosto já apareceu como desconhecido há pouco.
-
-        Deduplica 'desconhecido' pela aparência (não pelo tempo), então dois
-        desconhecidos DIFERENTES entrando juntos geram dois registros, mas a
-        mesma pessoa perdida e readquirida gera um só.
-        """
-
-        self._recent_unknowns = [
-            (moment, embedding)
-            for moment, embedding in self._recent_unknowns
-            if observed_at < moment + self.cooldown
-        ]
-        for _, embedding in self._recent_unknowns:
-            if self.engine.similarity(feature, embedding) >= 0.45:
-                return True
-        return False
-
-    def _emit_decision(
-        self, track_id: str, when: datetime, result: ConsensusResult
-    ) -> dict[str, Any] | None:
-        best = self._best.get(track_id)
-        feature = best[2].feature if best is not None else None
-        matched = result.status == MatchStatus.MATCHED and bool(result.external_id)
-        if not matched and feature is not None and self._same_recent_unknown(feature, when):
-            return None
-        session_id = f"vis-{uuid.uuid4().hex}"
-        evidence_ref = (
-            save_evidence(self.cv2, best[1], best[2], self.evidence_dir)
-            if best is not None
-            else None
-        )
-        payload = build_door_event(
-            session_id=session_id,
-            track_id=track_id,
-            camera_id=self.camera_id,
-            room_id=self.room_id,
-            consensus=result,
-            model_version=self.engine.model_version,
-            evidence_ref=evidence_ref,
-            confirmed_at=when,
-            observation_count=self._door_hits.get(track_id, 0),
-        )
-        self.outbox.enqueue(payload, now=when)
-        if matched and self.learned is not None and feature is not None:
-            if self.learned.consider(
-                self.engine,
-                external_id=result.external_id,
-                display_name=result.display_name,
-                feature=feature,
-                evidence_ref=evidence_ref,
-                when=when,
-                similarity=result.similarity,
-                quality=result.face_quality,
-                min_similarity=self.learn_min_similarity,
-                max_similarity=self.learn_max_similarity,
-                min_quality=self.learn_min_quality,
-            ):
-                print(
-                    f"[aprendizado] nova referência de {result.display_name} "
-                    f"(sim={result.similarity:.2f}).",
-                    flush=True,
-                )
-        elif not matched and feature is not None:
-            self._recent_unknowns.append((when, feature))
-        return payload
-
-    def _flush_expired(self, observed_at: datetime) -> list[dict[str, Any]]:
-        """Finaliza trilhas que sumiram (a pessoa saiu da porta).
-
-        Quem nunca foi reconhecido com certeza durante a passagem — e ficou
-        tempo suficiente na porta — é registrado como desconhecido só agora.
-        """
-
-        active = set(self.face_tracker.active_track_ids)
-        emitted: list[dict[str, Any]] = []
-        for track_id in list(self._known - active):
-            if (
-                track_id not in self._track_matched
-                and track_id in self._track_moved
-                and self._door_hits.get(track_id, 0) >= self.min_door_frames
-            ):
-                result = self.consensus.resolve(track_id)
-                when = self._last_seen.get(track_id, observed_at)
-                payload = self._emit_decision(track_id, when, result)
-                if payload is not None:
-                    emitted.append(payload)
-            self._door_hits.pop(track_id, None)
-            self._best.pop(track_id, None)
-            self._last_seen.pop(track_id, None)
-            self._track_matched.discard(track_id)
-            self._track_origin.pop(track_id, None)
-            self._track_moved.discard(track_id)
-            self.consensus.discard(track_id)
-            self._known.discard(track_id)
-        for person_key in [
-            key for key, until in self._present_until.items() if observed_at >= until
-        ]:
-            self._present_until.pop(person_key, None)
-        return emitted
-
-
-class RecognitionEngine(Protocol):
-    model_version: str
-
-    def detect(self, frame: Any) -> list[Any]: ...
-    def match(self, face: Any) -> MatchDecision: ...
-
-
-class VisionProcessor:
-    def __init__(
-        self,
-        engine: RecognitionEngine,
-        entry_tracker: EntryTracker,
-        outbox: VisionEventOutbox,
-    ) -> None:
-        self.engine = engine
-        self.entry_tracker = entry_tracker
-        self.outbox = outbox
-        self.face_tracker = FaceCentroidTracker()
-        self.consensus = IdentityConsensus()
-        self._observation_sequence = 0
-
-    def process_frame(self, frame: Any, observed_at: datetime) -> list[dict[str, Any]]:
-        emitted: list[dict[str, Any]] = []
-        faces = self.engine.detect(frame)
-        tracked_faces = self.face_tracker.update(faces, observed_at)
-        for tracked in tracked_faces:
-            self._observation_sequence += 1
-            observation_id = f"obs:{self.face_tracker.boot_id}:{self._observation_sequence}"
-            self.consensus.add(tracked.track_id, self.engine.match(tracked.face))
-            confirmation = self.entry_tracker.observe(
-                TrackObservation(
-                    track_id=tracked.track_id,
-                    observed_at=observed_at,
-                    centroid=Point(*tracked.face.centroid),
-                    face_observation_id=observation_id,
-                )
-            )
-            if confirmation is None:
-                continue
-            identity = self.consensus.resolve(tracked.track_id, consume=True)
-            payload = build_access_event(
-                confirmation, identity, model_version=self.engine.model_version
-            )
-            self.outbox.enqueue(payload, now=observed_at)
-            emitted.append(payload)
-        return emitted
+        raise VisionConfigurationError(
+            f"Geometria de calibração inválida: {exc}"
+        ) from exc
 
 
 class AuditApiClient:
-    def __init__(self, base_url: str, api_key: str, *, timeout_seconds: float = 3.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        timeout_seconds: float = 3.0,
+    ) -> None:
         self.client = httpx.Client(
             base_url=base_url,
             headers={"X-Camera-Key": api_key},
             timeout=timeout_seconds,
+            follow_redirects=False,
+            trust_env=False,
         )
 
     def close(self) -> None:
         self.client.close()
 
-    def send(self, payload: dict[str, Any]) -> tuple[bool, str]:
+    def send(
+        self,
+        payload: dict[str, Any],
+        *,
+        queued_at: datetime,
+    ) -> tuple[bool, str]:
         try:
-            response = self.client.post("/v1/webhooks/access-events", json=payload)
+            response = self.client.post(
+                "/v1/webhooks/access-events",
+                json=payload,
+                headers={
+                    "X-Delivery-Mode": "durable-outbox",
+                    "X-Event-Queued-At": queued_at.astimezone(UTC).isoformat(),
+                },
+            )
         except httpx.HTTPError:
             return False, "API_UNAVAILABLE"
         if response.status_code in {200, 201}:
@@ -678,15 +670,46 @@ class AuditApiClient:
 
 
 def flush_outbox(
-    outbox: VisionEventOutbox, api: AuditApiClient, *, now: datetime | None = None
-) -> tuple[int, int]:
+    outbox: VisionEventOutbox,
+    api: AuditApiClient,
+    *,
+    now: datetime | None = None,
+    limit: int = 5,
+    expected_camera_id: str | None = None,
+) -> tuple[int, int, int]:
     instant = now or datetime.now(UTC)
-    sent = failed = 0
-    for item in outbox.due(now=instant):
-        ok, code = api.send(item["payload"])
+    sent = retrying = dead = 0
+    for item in outbox.due(now=instant, limit=limit):
+        if (
+            expected_camera_id is not None
+            and item["payload"].get("camera_id") != expected_camera_id
+        ):
+            outbox.mark_dead(
+                item["event_id"],
+                error_code="OUTBOX_CAMERA_MISMATCH",
+                attempts=item["attempts"],
+            )
+            dead += 1
+            continue
+        ok, code = api.send(
+            item["payload"],
+            queued_at=item["created_at"],
+        )
         if ok:
             outbox.mark_sent(item["event_id"], now=instant)
             sent += 1
+        elif code in {
+            "API_HTTP_400",
+            "API_HTTP_409",
+            "API_HTTP_413",
+            "API_HTTP_422",
+        }:
+            outbox.mark_dead(
+                item["event_id"],
+                error_code=code,
+                attempts=item["attempts"],
+            )
+            dead += 1
         else:
             outbox.mark_failure(
                 item["event_id"],
@@ -694,8 +717,209 @@ def flush_outbox(
                 attempts=item["attempts"],
                 now=instant,
             )
-            failed += 1
-    return sent, failed
+            retrying += 1
+    return sent, retrying, dead
+
+
+class _WorkerServices:
+    def __init__(
+        self,
+        processor: VisionProcessor | DoorEventProcessor,
+        settings: VisionWorkerSettings,
+    ) -> None:
+        self.processor = processor
+        self.settings = settings
+        self.lease_outbox = (
+            processor.outbox
+            if settings.lease_path is None
+            or settings.lease_path == settings.outbox_path
+            else VisionEventOutbox(settings.lease_path)
+        )
+        if self.lease_outbox is not processor.outbox:
+            self.lease_outbox.initialize()
+        self.owner_id = f"worker:{uuid.uuid4().hex}"
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._drain = False
+        self._failure: Exception | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"vision-services-{settings.camera_id}",
+            daemon=True,
+        )
+        self._lease_thread = threading.Thread(
+            target=self._renew_lease,
+            name=f"vision-lease-{settings.camera_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        if not self.lease_outbox.acquire_lease(
+            camera_id=self.settings.camera_id,
+            owner_id=self.owner_id,
+            now=datetime.now(UTC),
+        ):
+            raise VisionConfigurationError(
+                "Já existe um worker ativo para esta câmera e outbox."
+            )
+        self._lease_thread.start()
+        self._thread.start()
+
+    def wake(self) -> None:
+        self._wake.set()
+
+    def ensure_healthy(self) -> None:
+        if self._failure is not None:
+            raise VisionConfigurationError(
+                "O serviço de entrega e manutenção foi interrompido."
+            ) from self._failure
+
+    def close(self, *, drain: bool) -> None:
+        self._drain = drain
+        self._stop.set()
+        self._wake.set()
+        self._thread.join(timeout=20)
+        self._lease_thread.join(timeout=5)
+        if self._thread.is_alive() or self._lease_thread.is_alive():
+            print("Serviço de entrega ainda finalizando; o lease será preservado.")
+            return
+        self.lease_outbox.release_lease(
+            camera_id=self.settings.camera_id,
+            owner_id=self.owner_id,
+        )
+
+    def _renew_lease(self) -> None:
+        try:
+            while not self._stop.wait(timeout=30):
+                if not self.lease_outbox.acquire_lease(
+                    camera_id=self.settings.camera_id,
+                    owner_id=self.owner_id,
+                    now=datetime.now(UTC),
+                ):
+                    raise VisionConfigurationError(
+                        "O lease exclusivo da câmera foi perdido."
+                    )
+        except Exception as exc:
+            self._failure = exc
+            self._stop.set()
+            self._wake.set()
+
+    def _run(self) -> None:
+        api = (
+            None
+            if self.settings.dry_run
+            else AuditApiClient(
+                self.settings.api_base_url,
+                self.settings.api_key,
+            )
+        )
+        started_at = datetime.now(UTC)
+        maintenance_offset = 10 + sum(ord(char) for char in self.settings.camera_id) % 40
+        next_maintenance = started_at + timedelta(minutes=maintenance_offset)
+        next_learning_refresh = started_at + timedelta(
+            seconds=self.settings.learned_refresh_seconds
+        )
+        try:
+            while not self._stop.is_set():
+                now = datetime.now(UTC)
+                if api is not None:
+                    _report_delivery(
+                        *flush_outbox(
+                            self.processor.outbox,
+                            api,
+                            now=now,
+                            expected_camera_id=self.settings.camera_id,
+                        )
+                    )
+                if now >= next_learning_refresh and self.processor.learned is not None:
+                    try:
+                        if not self.processor.learned.initialized:
+                            self.processor.learned.initialize()
+                        _refresh_learned_references(
+                            self.processor.engine,
+                            self.processor.learned,
+                        )
+                    except Exception:
+                        self.processor.learned.initialized = False
+                        self.processor.engine.replace_learned_references(())
+                        print(
+                            "Referências aprendidas desativadas até a próxima "
+                            "recarga válida."
+                        )
+                    next_learning_refresh = now + timedelta(
+                        seconds=self.settings.learned_refresh_seconds
+                    )
+                if now >= next_maintenance:
+                    try:
+                        if self.settings.dry_run:
+                            self.processor.outbox.purge_dry_run(
+                                before=now
+                                - timedelta(
+                                    days=self.settings.dry_run_outbox_retention_days
+                                ),
+                                max_events=self.settings.dry_run_outbox_max_events,
+                            )
+                        else:
+                            self.processor.outbox.purge_sent(
+                                before=now
+                                - timedelta(
+                                    days=self.settings.outbox_sent_retention_days
+                                )
+                            )
+                    except Exception:
+                        print("A retenção da outbox será tentada novamente.")
+                    if self.processor.evidence_store is not None:
+                        try:
+                            self.processor.evidence_store.purge(now=now)
+                        except Exception:
+                            print("A retenção de evidências será tentada novamente.")
+                    next_maintenance = now + timedelta(hours=1)
+                self._wake.wait(timeout=1)
+                self._wake.clear()
+            if self._drain and api is not None:
+                _report_delivery(
+                    *flush_outbox(
+                        self.processor.outbox,
+                        api,
+                        now=datetime.now(UTC),
+                        expected_camera_id=self.settings.camera_id,
+                    )
+                )
+        except Exception as exc:
+            self._failure = exc
+        finally:
+            if api is not None:
+                api.close()
+
+
+def _verified_model_fingerprint(settings: VisionWorkerSettings) -> str:
+    try:
+        from scripts.verify_vision_models import ModelBundleError, verify_bundle
+
+        return verify_bundle(settings.models_dir, settings.model_fingerprint)
+    except ImportError as exc:
+        raise VisionConfigurationError(
+            "O verificador do bundle de modelos não está disponível."
+        ) from exc
+    except ModelBundleError as exc:
+        raise VisionConfigurationError(str(exc)) from exc
+
+
+def _refresh_learned_references(
+    engine: ArcFaceEngine,
+    learned: LearnedGallery,
+) -> int:
+    approved = learned.approved_references(
+        engine,
+        allowed_external_ids=engine.official_external_ids,
+    )
+    engine.replace_learned_references(
+        [
+            GalleryEntry(external_id, display_name, feature)
+            for external_id, display_name, feature in approved
+        ]
+    )
+    return len(approved)
 
 
 def create_processor(
@@ -706,24 +930,78 @@ def create_processor(
         camera_id=settings.camera_id,
         room_id=settings.room_id,
     )
-    engine = ArcFaceEngine(thresholds=settings.thresholds)
-    enrolled = engine.load_gallery(settings.gallery_manifest)
+    if settings.mode == "entry" and tracker_config.entry_line is None:
+        raise VisionConfigurationError(
+            "O modo entry exige entry_line na calibração."
+        )
+    fingerprint = _verified_model_fingerprint(settings)
+    engine = ArcFaceEngine(
+        thresholds=settings.thresholds,
+        model_root=settings.models_dir,
+        model_fingerprint=fingerprint,
+        det_size=settings.detection_size,
+        providers=settings.providers,
+        quality_policy=settings.quality_policy,
+    )
+    enrolled = engine.load_gallery(
+        settings.gallery_manifest,
+        cache_path=settings.gallery_cache_path,
+    )
     if enrolled < 1:
         raise VisionConfigurationError("A galeria facial está vazia.")
-    learned: LearnedGallery | None = None
-    if settings.mode == "door" and _bool_env("RAG_AUDIT_LEARN_ENABLED", True):
-        learned = LearnedGallery(
-            Path(settings.gallery_manifest).parent / "learned.db",
-            max_per_person=int(
-                _float_env("RAG_AUDIT_LEARN_MAX_PER_PERSON", 5, minimum=1, maximum=50)
-            ),
-        )
+
+    learned = LearnedGallery(
+        settings.learned_path,
+        max_per_person=settings.learn_max_per_person,
+    )
+    try:
         learned.initialize()
-        learned_count = learned.load_into(engine)
-        if learned_count:
-            print(f"{learned_count} referência(s) aprendida(s) carregada(s).")
+        learned_count = _refresh_learned_references(engine, learned)
+    except Exception:
+        engine.replace_learned_references(())
+        learned_count = 0
+        print("Referências aprendidas indisponíveis; a galeria oficial permanece ativa.")
+    if learned_count:
+        print(f"{learned_count} referência(s) aprovada(s) carregada(s).")
+
+    evidence_store: EvidenceStore | None = None
+    if not settings.dry_run or settings.dry_run_save_evidence:
+        evidence_store = EvidenceStore(
+            settings.evidence_dir,
+            ttl=timedelta(days=settings.evidence_ttl_days),
+            max_storage_bytes=settings.evidence_max_bytes,
+            max_item_bytes=settings.evidence_max_item_bytes,
+            evict_oldest=settings.evidence_evict_oldest,
+        )
+        evidence_store.initialize()
+        evidence_store.purge()
+
     outbox = VisionEventOutbox(settings.outbox_path)
     outbox.initialize()
+    if settings.dry_run:
+        outbox.purge_dry_run(
+            before=datetime.now(UTC)
+            - timedelta(days=settings.dry_run_outbox_retention_days),
+            max_events=settings.dry_run_outbox_max_events,
+        )
+    else:
+        outbox.purge_sent(
+            before=datetime.now(UTC)
+            - timedelta(days=settings.outbox_sent_retention_days)
+        )
+    detection_region = DetectionRegion.from_polygons(
+        tracker_config.door_zone,
+        tracker_config.inside_zone,
+        padding=settings.roi_padding,
+    )
+    common = {
+        "evidence_store": evidence_store,
+        "learned": learned,
+        "learning_policy": settings.learning_policy,
+        "consensus_policy": settings.consensus_policy,
+        "detection_region": detection_region,
+        "dry_run": settings.dry_run,
+    }
     if settings.mode == "door":
         return DoorEventProcessor(
             engine,
@@ -731,45 +1009,62 @@ def create_processor(
             outbox,
             camera_id=settings.camera_id,
             room_id=settings.room_id,
-            evidence_dir=settings.evidence_dir,
             min_door_frames=settings.min_door_frames,
-            cooldown=tracker_config.cooldown,
-            learned=learned,
-            learn_min_similarity=_float_env(
-                "RAG_AUDIT_LEARN_MIN_SIMILARITY", 0.50, minimum=0, maximum=1
-            ),
-            learn_max_similarity=_float_env(
-                "RAG_AUDIT_LEARN_MAX_SIMILARITY", 0.85, minimum=0, maximum=1
-            ),
-            learn_min_quality=_float_env(
-                "RAG_AUDIT_LEARN_MIN_QUALITY", 0.50, minimum=0, maximum=1
-            ),
+            **common,
         )
-    return VisionProcessor(engine, EntryTracker(tracker_config), outbox)
+    return VisionProcessor(
+        engine,
+        EntryTracker(tracker_config),
+        outbox,
+        decision_wait=timedelta(seconds=settings.decision_wait_seconds),
+        **common,
+    )
+
+
+def _report_delivery(sent: int, retrying: int, dead: int) -> None:
+    if sent:
+        print(f"{sent} evento(s) entregue(s) à API.")
+    if retrying:
+        print(f"{retrying} evento(s) mantido(s) para reenvio.")
+    if dead:
+        print(f"{dead} evento(s) movido(s) para revisão manual.")
+
+
+def _report_events(events: list[dict[str, Any]]) -> None:
+    for payload in events:
+        print(
+            f"Evento visual enfileirado: {payload['event_id']} "
+            f"({payload['identity_status']})."
+        )
 
 
 def run_forever(settings: VisionWorkerSettings) -> None:
     processor = create_processor(settings)
-    api = AuditApiClient(settings.api_base_url, settings.api_key)
-    cv2 = processor.engine.cv2  # type: ignore[attr-defined]
+    services = _WorkerServices(processor, settings)
+    services.start()
+    cv2 = processor.engine.cv2
     rtsp_url = build_rtsp_url(settings.camera)
     sample_interval = 1.0 / settings.sample_fps
     last_processed = 0.0
     print(
         f"Worker iniciado para {settings.camera_id}/{settings.room_id}; "
-        f"câmera {settings.camera.display_url}."
+        f"câmera {settings.camera.display_url}; modo {settings.mode}."
     )
     if settings.dry_run:
-        print("Modo dry-run: entradas serão detectadas e enfileiradas, sem envio à API.")
+        print("Dry-run ativo: eventos ficam na outbox isolada de calibração.")
     try:
         while True:
+            services.ensure_healthy()
             capture = cv2.VideoCapture()
             timeout_ms = round(settings.camera.timeout_seconds * 1000)
             if hasattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC"):
                 capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, timeout_ms)
             if hasattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC"):
                 capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, timeout_ms)
-            opened = capture.open(rtsp_url, getattr(cv2, "CAP_FFMPEG", 0))
+            try:
+                opened = capture.open(rtsp_url, getattr(cv2, "CAP_FFMPEG", 0))
+            except Exception:
+                opened = False
             if not opened:
                 print("Stream indisponível; nova tentativa em 3 segundos.")
                 capture.release()
@@ -778,28 +1073,46 @@ def run_forever(settings: VisionWorkerSettings) -> None:
             print("Stream RTSP conectado.")
             try:
                 while True:
-                    received, frame = capture.read()
+                    services.ensure_healthy()
+                    try:
+                        received, frame = capture.read()
+                    except Exception:
+                        received, frame = False, None
                     if not received or frame is None:
-                        print("Stream interrompido; iniciando reconexão segura.")
+                        print("Stream interrompido; reiniciando o estado de rastreamento.")
+                        _report_events(processor.flush(datetime.now(UTC)))
+                        services.wake()
                         break
                     monotonic_now = time.monotonic()
                     if monotonic_now - last_processed < sample_interval:
                         continue
                     last_processed = monotonic_now
-                    emitted = processor.process_frame(frame, datetime.now(UTC))
-                    for payload in emitted:
-                        print(
-                            f"Entrada visual enfileirada: {payload['event_id']} "
-                            f"({payload['identity_status']})."
-                        )
-                    if not settings.dry_run:
-                        sent, failed = flush_outbox(processor.outbox, api)
-                        if sent:
-                            print(f"{sent} evento(s) entregue(s) à API.")
-                        if failed:
-                            print(f"{failed} evento(s) mantido(s) para reenvio.")
+                    events = processor.process_frame(frame, datetime.now(UTC))
+                    _report_events(events)
+                    if events:
+                        services.wake()
             finally:
                 capture.release()
             time.sleep(1)
     finally:
-        api.close()
+        try:
+            _report_events(processor.flush(datetime.now(UTC)))
+            services.wake()
+        finally:
+            services.close(drain=not settings.dry_run)
+
+
+__all__ = [
+    "AuditApiClient",
+    "DoorEventProcessor",
+    "VisionConfigurationError",
+    "VisionProcessor",
+    "VisionWorkerSettings",
+    "build_access_event",
+    "build_door_event",
+    "create_processor",
+    "flush_outbox",
+    "load_entry_tracker_config",
+    "run_forever",
+    "safe_person_id",
+]

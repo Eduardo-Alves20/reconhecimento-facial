@@ -1,10 +1,4 @@
-"""Confirmação determinística de entradas a partir de trilhas de pessoas.
-
-O módulo não detecta pessoas nem rostos. Ele recebe centróides normalizados
-produzidos por um detector/rastreador e confirma apenas o movimento compatível
-com entrada. A decisão pode usar uma linha direcional (mais segura) ou, na
-ausência dela, a sequência de zonas ``porta -> interior``.
-"""
+"""Confirma entradas a partir de trajetórias normalizadas."""
 
 from __future__ import annotations
 
@@ -26,8 +20,6 @@ def _require_aware(value: datetime, field_name: str) -> None:
 
 @dataclass(frozen=True, slots=True)
 class Point:
-    """Ponto em coordenadas normalizadas da imagem (0 a 1)."""
-
     x: float
     y: float
 
@@ -61,10 +53,26 @@ def _point_on_segment(point: Point, a: Point, b: Point) -> bool:
     )
 
 
+def _segments_intersect(a: Point, b: Point, c: Point, d: Point) -> bool:
+    orientations = (_cross(a, b, c), _cross(a, b, d), _cross(c, d, a), _cross(c, d, b))
+    if (
+        (orientations[0] > _GEOMETRY_EPSILON and orientations[1] < -_GEOMETRY_EPSILON)
+        or (orientations[0] < -_GEOMETRY_EPSILON and orientations[1] > _GEOMETRY_EPSILON)
+    ) and (
+        (orientations[2] > _GEOMETRY_EPSILON and orientations[3] < -_GEOMETRY_EPSILON)
+        or (orientations[2] < -_GEOMETRY_EPSILON and orientations[3] > _GEOMETRY_EPSILON)
+    ):
+        return True
+    return (
+        _point_on_segment(c, a, b)
+        or _point_on_segment(d, a, b)
+        or _point_on_segment(a, c, d)
+        or _point_on_segment(b, c, d)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Polygon:
-    """Zona poligonal fechada; pontos na borda pertencem à zona."""
-
     points: tuple[Point, ...]
 
     def __post_init__(self) -> None:
@@ -73,6 +81,25 @@ class Polygon:
             raise ValueError("um polígono precisa de pelo menos três pontos")
         if any(not isinstance(point, Point) for point in points):
             raise TypeError("os vértices do polígono devem ser Point")
+        if len(set(points)) != len(points):
+            raise ValueError("um polígono não pode repetir vértices")
+
+        edges = list(zip(points, points[1:] + points[:1], strict=True))
+        for first_index, (first_start, first_end) in enumerate(edges):
+            for second_index in range(first_index + 1, len(edges)):
+                if (
+                    second_index == first_index + 1
+                    or (first_index == 0 and second_index == len(edges) - 1)
+                ):
+                    continue
+                second_start, second_end = edges[second_index]
+                if _segments_intersect(
+                    first_start,
+                    first_end,
+                    second_start,
+                    second_end,
+                ):
+                    raise ValueError("o polígono não pode ser auto-intersectante")
 
         twice_area = sum(
             current.x * following.y - following.x * current.y
@@ -82,9 +109,14 @@ class Polygon:
             raise ValueError("o polígono não pode ter área zero")
         object.__setattr__(self, "points", points)
 
-    def contains(self, point: Point) -> bool:
-        """Retorna ``True`` se o ponto estiver dentro ou sobre a borda."""
+    @property
+    def center(self) -> Point:
+        return Point(
+            sum(point.x for point in self.points) / len(self.points),
+            sum(point.y for point in self.points) / len(self.points),
+        )
 
+    def contains(self, point: Point) -> bool:
         inside = False
         previous = self.points[-1]
         for current in self.points:
@@ -105,8 +137,6 @@ class Polygon:
 
 @dataclass(frozen=True, slots=True)
 class DirectedLine:
-    """Linha cuja esquerda ou direita é declarada como lado interior."""
-
     start: Point
     end: Point
     inside_side: Literal["left", "right"] = "left"
@@ -117,15 +147,41 @@ class DirectedLine:
         if self.inside_side not in ("left", "right"):
             raise ValueError("inside_side deve ser 'left' ou 'right'")
 
-    def side_of(self, point: Point) -> int:
-        """Retorna ``1`` para interior, ``-1`` para exterior e ``0`` na linha."""
-
-        signed = _cross(self.start, self.end, point)
+    def signed_distance(self, point: Point) -> float:
+        length = math.hypot(self.end.x - self.start.x, self.end.y - self.start.y)
+        signed = _cross(self.start, self.end, point) / length
         if self.inside_side == "right":
             signed = -signed
-        if abs(signed) <= _GEOMETRY_EPSILON:
+        return signed
+
+    def side_of(self, point: Point, *, deadband: float = 0.0) -> int:
+        signed = self.signed_distance(point)
+        if abs(signed) <= max(deadband, _GEOMETRY_EPSILON):
             return 0
         return 1 if signed > 0 else -1
+
+    def crosses_segment(
+        self,
+        previous: Point,
+        current: Point,
+        *,
+        segment_margin: float = 0.0,
+    ) -> bool:
+        rx = current.x - previous.x
+        ry = current.y - previous.y
+        sx = self.end.x - self.start.x
+        sy = self.end.y - self.start.y
+        denominator = rx * sy - ry * sx
+        if abs(denominator) <= _GEOMETRY_EPSILON:
+            return False
+        qpx = self.start.x - previous.x
+        qpy = self.start.y - previous.y
+        movement_fraction = (qpx * sy - qpy * sx) / denominator
+        line_fraction = (qpx * ry - qpy * rx) / denominator
+        return (
+            -_GEOMETRY_EPSILON <= movement_fraction <= 1 + _GEOMETRY_EPSILON
+            and -segment_margin <= line_fraction <= 1 + segment_margin
+        )
 
 
 class EntryMethod(StrEnum):
@@ -135,8 +191,6 @@ class EntryMethod(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class EntryTrackerConfig:
-    """Geometria e tolerâncias de uma câmera/sala."""
-
     camera_id: str
     room_id: str
     door_zone: Polygon
@@ -146,6 +200,10 @@ class EntryTrackerConfig:
     min_inside_observations: int = 2
     track_timeout: timedelta = timedelta(seconds=5)
     cooldown: timedelta = timedelta(seconds=10)
+    line_deadband: float = 0.015
+    line_segment_margin: float = 0.05
+    min_crossing_displacement: float = 0.04
+    max_transition: timedelta = timedelta(seconds=3)
 
     def __post_init__(self) -> None:
         camera_id = self.camera_id.strip()
@@ -160,14 +218,34 @@ class EntryTrackerConfig:
             raise ValueError("track_timeout deve ser positivo")
         if self.cooldown < timedelta(0):
             raise ValueError("cooldown não pode ser negativo")
+        for name, value in (
+            ("line_deadband", self.line_deadband),
+            ("line_segment_margin", self.line_segment_margin),
+            ("min_crossing_displacement", self.min_crossing_displacement),
+        ):
+            if isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} deve estar entre 0 e 1")
+        if self.max_transition <= timedelta(0):
+            raise ValueError("max_transition deve ser positivo")
+        if self.entry_line is not None:
+            door_distance = self.entry_line.signed_distance(self.door_zone.center)
+            inside_distance = self.entry_line.signed_distance(self.inside_zone.center)
+            if door_distance >= -self.line_deadband:
+                raise ValueError("door_zone precisa ficar no lado externo da entry_line")
+            if inside_distance <= self.line_deadband:
+                raise ValueError("inside_zone precisa ficar no lado interno da entry_line")
+            if not self.entry_line.crosses_segment(
+                self.door_zone.center,
+                self.inside_zone.center,
+                segment_margin=self.line_segment_margin,
+            ):
+                raise ValueError("entry_line não cobre a passagem entre as zonas")
         object.__setattr__(self, "camera_id", camera_id)
         object.__setattr__(self, "room_id", room_id)
 
 
 @dataclass(frozen=True, slots=True)
 class TrackObservation:
-    """Uma amostra de uma trilha, normalmente o centro inferior da pessoa."""
-
     track_id: str
     observed_at: datetime
     centroid: Point
@@ -189,8 +267,6 @@ class TrackObservation:
 
 @dataclass(frozen=True, slots=True)
 class EntryConfirmation:
-    """Entrada visual confirmada, ainda que a identidade seja desconhecida."""
-
     session_id: str
     camera_id: str
     room_id: str
@@ -216,6 +292,9 @@ class _TrackState:
     inside_count: int = 0
     last_line_side: int = 0
     line_crossed: bool = False
+    door_ready_at: datetime | None = None
+    door_origin: Point | None = None
+    last_point: Point | None = None
 
     def record(self, observation: TrackObservation) -> None:
         self.last_seen = observation.observed_at
@@ -224,15 +303,10 @@ class _TrackState:
         if face_id is not None and face_id not in self.face_id_set:
             self.face_id_set.add(face_id)
             self.face_ids.append(face_id)
+        self.last_point = observation.centroid
 
 
 class EntryTracker:
-    """Máquina de estados para uma única câmera.
-
-    As observações devem chegar em ordem cronológica. ``observe`` retorna uma
-    confirmação somente no instante em que a persistência interior é atingida.
-    """
-
     def __init__(self, config: EntryTrackerConfig) -> None:
         self.config = config
         self._tracks: dict[str, _TrackState] = {}
@@ -249,8 +323,6 @@ class EntryTracker:
         return tuple(state.session_id for state in self._tracks.values())
 
     def observe(self, observation: TrackObservation) -> EntryConfirmation | None:
-        """Processa uma amostra e, quando aplicável, confirma uma entrada."""
-
         self._move_clock(observation.observed_at)
 
         cooldown_until = self._cooldowns.get(observation.track_id)
@@ -264,28 +336,26 @@ class EntryTracker:
             state = self._new_state(observation)
             self._tracks[observation.track_id] = state
         elif observation.observed_at < state.last_seen:
-            # Normalmente alcançado pela verificação global, mantido também
-            # aqui para preservar a invariância caso a implementação evolua.
             raise ValueError("observações da trilha devem estar em ordem cronológica")
 
+        previous_point = state.last_point
         state.record(observation)
         if self.config.entry_line is None:
             confirmed = self._observe_zone_sequence(state, observation)
         else:
-            confirmed = self._observe_directed_line(state, observation)
+            confirmed = self._observe_directed_line(state, observation, previous_point)
 
         if not confirmed:
             return None
         return self._confirm(observation.track_id, state, observation.observed_at)
 
     def advance_time(self, now: datetime) -> tuple[str, ...]:
-        """Expira trilhas inativas e retorna os IDs das sessões removidas."""
-
         return self._move_clock(now)
 
-    def reset(self) -> None:
-        """Remove estados voláteis; a configuração permanece inalterada."""
+    def discard(self, track_id: str) -> None:
+        self._tracks.pop(track_id, None)
 
+    def reset(self) -> None:
         self._tracks.clear()
         self._cooldowns.clear()
         self._watermark = None
@@ -344,8 +414,6 @@ class EntryTracker:
         in_door = self.config.door_zone.contains(observation.centroid)
         in_inside = self.config.inside_zone.contains(observation.centroid)
 
-        # Uma trilha que nasceu dentro da sala é uma possível saída. Ela só
-        # pode ser armada após uma observação inequivocamente fora das zonas.
         if state.origin_inside:
             if not in_inside and not in_door:
                 state.origin_inside = False
@@ -355,36 +423,41 @@ class EntryTracker:
             if in_door:
                 state.door_count += 1
                 if state.door_count >= self.config.min_door_observations:
-                    state.door_ready = True
+                    self._arm(state, observation)
             else:
                 state.door_count = 0
-                # Pular diretamente para o interior não comprova travessia.
                 if in_inside:
                     state.origin_inside = True
             return False
 
-        # Depois de armada na porta, a zona interior tem prioridade em eventual
-        # pequena sobreposição entre os dois polígonos.
+        if not self._transition_valid(state, observation):
+            self._reset_candidate(state)
+            return False
         if in_inside:
+            if not self._has_minimum_displacement(state, observation.centroid):
+                state.inside_count = 0
+                return False
             state.inside_count += 1
             return state.inside_count >= self.config.min_inside_observations
         if in_door:
             state.inside_count = 0
             return False
 
-        # A pessoa recuou para fora antes de entrar; uma nova persistência na
-        # porta será exigida.
-        state.door_count = 0
-        state.door_ready = False
-        state.inside_count = 0
+        self._reset_candidate(state)
         return False
 
     def _observe_directed_line(
-        self, state: _TrackState, observation: TrackObservation
+        self,
+        state: _TrackState,
+        observation: TrackObservation,
+        previous_point: Point | None,
     ) -> bool:
         line = self.config.entry_line
         assert line is not None
-        side = line.side_of(observation.centroid)
+        side = line.side_of(
+            observation.centroid,
+            deadband=self.config.line_deadband,
+        )
         in_door = self.config.door_zone.contains(observation.centroid)
         in_inside = self.config.inside_zone.contains(observation.centroid)
 
@@ -392,23 +465,34 @@ class EntryTracker:
             if in_door:
                 state.door_count += 1
                 if state.door_count >= self.config.min_door_observations:
-                    state.door_ready = True
-            elif not state.door_ready:
+                    self._arm(state, observation)
+            elif state.door_ready:
+                self._reset_candidate(state)
+            else:
                 state.door_count = 0
-
-            # Voltar ao exterior cancela uma travessia interior ainda não
-            # persistida, mas preserva a possibilidade de uma nova entrada.
             state.line_crossed = False
             state.inside_count = 0
             state.last_line_side = side
             return False
 
         if side == 0:
-            # Pontos exatamente na linha não definem direção nem quebram a
-            # persistência exterior já observada.
             return False
 
-        if state.door_ready and state.last_line_side < 0:
+        if not self._transition_valid(state, observation):
+            self._reset_candidate(state)
+            state.last_line_side = side
+            return False
+        if (
+            state.door_ready
+            and state.last_line_side < 0
+            and previous_point is not None
+            and line.crosses_segment(
+                previous_point,
+                observation.centroid,
+                segment_margin=self.config.line_segment_margin,
+            )
+            and self._has_minimum_displacement(state, observation.centroid)
+        ):
             state.line_crossed = True
         state.last_line_side = side
 
@@ -421,6 +505,47 @@ class EntryTracker:
 
         state.inside_count += 1
         return state.inside_count >= self.config.min_inside_observations
+
+    @staticmethod
+    def _displacement(first: Point, second: Point) -> float:
+        return math.hypot(first.x - second.x, first.y - second.y)
+
+    def _arm(self, state: _TrackState, observation: TrackObservation) -> None:
+        if not state.door_ready:
+            state.door_ready = True
+            state.door_ready_at = observation.observed_at
+            state.door_origin = observation.centroid
+
+    def _transition_valid(
+        self,
+        state: _TrackState,
+        observation: TrackObservation,
+    ) -> bool:
+        return (
+            state.door_ready_at is not None
+            and observation.observed_at - state.door_ready_at
+            <= self.config.max_transition
+        )
+
+    def _has_minimum_displacement(
+        self,
+        state: _TrackState,
+        current: Point,
+    ) -> bool:
+        return (
+            state.door_origin is not None
+            and self._displacement(state.door_origin, current)
+            >= self.config.min_crossing_displacement
+        )
+
+    @staticmethod
+    def _reset_candidate(state: _TrackState) -> None:
+        state.door_count = 0
+        state.door_ready = False
+        state.inside_count = 0
+        state.line_crossed = False
+        state.door_ready_at = None
+        state.door_origin = None
 
     def _confirm(
         self, track_id: str, state: _TrackState, confirmed_at: datetime

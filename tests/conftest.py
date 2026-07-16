@@ -22,6 +22,7 @@ def settings(tmp_path: Path) -> Settings:
     """Use one real, file-backed SQLite database per test."""
     return Settings(
         database_path=tmp_path / "rag-audit-test.sqlite3",
+        evidence_dir=tmp_path / "evidence",
         camera_api_key=TEST_CAMERA_KEY,
         admin_username=TEST_ADMIN_USERNAME,
         admin_password=TEST_ADMIN_PASSWORD,

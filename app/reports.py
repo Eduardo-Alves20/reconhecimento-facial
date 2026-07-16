@@ -7,7 +7,6 @@ from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
@@ -199,6 +198,14 @@ def build_event_pdf(event: dict[str, Any], timezone_name: str) -> bytes:
         ("Permissão para a sala", "Sim" if context.get("permission_match") else "Não"),
         ("Track visual", observation.get("track_id") or "Não informado"),
         ("Motor de reconhecimento", observation.get("recognition_model") or "Não informado"),
+        (
+            "Fingerprint do modelo",
+            observation.get("recognition_model_fingerprint") or "Não informado",
+        ),
+        (
+            "Captura da evidência",
+            observation.get("evidence_captured_at") or "Não informada",
+        ),
         (
             "Chamados qualificáveis",
             ", ".join(f"{item['incident_id']} - {item['title']}" for item in incidents)

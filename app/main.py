@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import AsyncIterator
 from zoneinfo import ZoneInfo
@@ -29,9 +29,14 @@ from fastapi.templating import Jinja2Templates
 from .alerts import AlertWorker
 from .config import PROJECT_DIR, Settings
 from .database import Repository, utc_now
-from .models import AccessEventIn, Decision, RiskLevel
+from .models import AccessEventIn, Decision, IdentityStatus, RiskLevel
 from .reports import build_consolidated_pdf, build_event_pdf
 from .risk_engine import evaluate_access
+from .vision.evidence import (
+    EvidenceIntegrityError,
+    EvidenceNotFoundError,
+    EvidenceStore,
+)
 
 
 templates = Jinja2Templates(directory=str(PROJECT_DIR / "app" / "templates"))
@@ -76,10 +81,17 @@ def _repository(request: Request) -> Repository:
 
 def require_camera_key(
     request: Request,
-    x_camera_key: str | None = Header(default=None, alias="X-Camera-Key"),
+    camera_id: str,
+    supplied_key: str | None,
 ) -> None:
-    expected = _settings(request).camera_api_key.encode("utf-8")
-    supplied = (x_camera_key or "").encode("utf-8")
+    configured = _settings(request).camera_key_for(camera_id)
+    if configured is None or supplied_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Credencial da câmera inválida.",
+        )
+    expected = (configured or "").encode("utf-8")
+    supplied = supplied_key.encode("utf-8")
     if not hmac.compare_digest(supplied, expected):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -191,14 +203,40 @@ def _webhook_receipt(event: dict, *, idempotent_replay: bool) -> dict:
     }
 
 
+async def _maintain_evidence(
+    evidence_store: EvidenceStore,
+    stop_event: asyncio.Event,
+) -> None:
+    delay_seconds = 3_600
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay_seconds)
+        except TimeoutError:
+            try:
+                await asyncio.to_thread(evidence_store.purge)
+                delay_seconds = 3_600
+            except Exception:
+                print("A retenção de evidências da API será tentada novamente.")
+                delay_seconds = 300
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     app_settings = settings or Settings.from_env()
     app_settings.validate()
     repository = Repository(app_settings.database_path)
+    evidence_store = EvidenceStore(
+        app_settings.evidence_dir,
+        ttl=timedelta(days=app_settings.evidence_ttl_days),
+        max_storage_bytes=app_settings.evidence_max_bytes,
+        max_item_bytes=app_settings.evidence_max_item_bytes,
+        evict_oldest=app_settings.evidence_evict_oldest,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         repository.initialize()
+        evidence_store.initialize()
+        evidence_store.purge()
         if app_settings.seed_demo_data:
             repository.seed_demo_data(app_settings.policy_version)
         stop_event = asyncio.Event()
@@ -206,12 +244,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.state.alert_worker = worker
         application.state.alert_stop_event = stop_event
         worker_task = asyncio.create_task(worker.run(stop_event), name="rag-audit-alert-worker")
+        evidence_task = asyncio.create_task(
+            _maintain_evidence(evidence_store, stop_event),
+            name="rag-audit-evidence-maintenance",
+        )
         application.state.alert_worker_task = worker_task
+        application.state.evidence_maintenance_task = evidence_task
         try:
             yield
         finally:
             stop_event.set()
             await worker_task
+            await evidence_task
 
     application = FastAPI(
         title="RAG-Audit",
@@ -227,6 +271,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.settings = app_settings
     application.state.repository = repository
+    application.state.evidence_store = evidence_store
     application.state.broker = EventBroker()
     application.mount(
         "/static", StaticFiles(directory=str(PROJECT_DIR / "app" / "static")), name="static"
@@ -265,13 +310,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         worker_task = getattr(request.app.state, "alert_worker_task", None)
         worker_ready = worker_task is not None and not worker_task.done()
-        ready = database_ready and worker_ready and policies_ready
+        evidence_task = getattr(
+            request.app.state,
+            "evidence_maintenance_task",
+            None,
+        )
+        evidence_ready = evidence_task is not None and not evidence_task.done()
+        ready = database_ready and worker_ready and evidence_ready and policies_ready
         return JSONResponse(
             status_code=200 if ready else 503,
             content={
                 "status": "ready" if ready else "unavailable",
                 "database": database_ready,
                 "alert_worker": worker_ready,
+                "evidence_maintenance": evidence_ready,
                 "policies": policies_ready,
             },
         )
@@ -295,16 +347,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/v1/webhooks/access-events",
         tags=["camera"],
         summary="Receber um evento idempotente da câmera",
-        dependencies=[Depends(require_camera_key)],
     )
     async def receive_access_event(
         event: AccessEventIn,
         request: Request,
         background_tasks: BackgroundTasks,
+        x_camera_key: str | None = Header(default=None, alias="X-Camera-Key"),
+        x_delivery_mode: str | None = Header(default=None, alias="X-Delivery-Mode"),
+        x_event_queued_at: str | None = Header(
+            default=None,
+            alias="X-Event-Queued-At",
+        ),
     ) -> JSONResponse:
         started = perf_counter()
         received_at = utc_now()
         repo = _repository(request)
+        require_camera_key(request, event.camera_id, x_camera_key)
+        if (x_delivery_mode is None) != (x_event_queued_at is None):
+            raise HTTPException(
+                status_code=422,
+                detail="Metadados de entrega enfileirada incompletos.",
+            )
+        if x_delivery_mode not in {None, "durable-outbox"}:
+            raise HTTPException(
+                status_code=422,
+                detail="X-Delivery-Mode não suportado.",
+            )
         event_data, payload_hash = _canonical_payload(event)
 
         existing = await asyncio.to_thread(repo.get_idempotency_record, event.event_id)
@@ -322,11 +390,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if app_settings.enforce_event_freshness:
             event_instant = event.timestamp.astimezone(UTC)
+            max_age_seconds = app_settings.event_max_age_seconds
+            if x_delivery_mode is not None:
+                if x_delivery_mode != "durable-outbox" or not x_event_queued_at:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Metadados de entrega enfileirada inválidos.",
+                    )
+                try:
+                    parsed_queued_at = datetime.fromisoformat(x_event_queued_at)
+                except (OverflowError, ValueError):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="X-Event-Queued-At inválido.",
+                    ) from None
+                if (
+                    parsed_queued_at.tzinfo is None
+                    or parsed_queued_at.utcoffset() is None
+                ):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="X-Event-Queued-At deve incluir fuso.",
+                    )
+                queued_at = parsed_queued_at.astimezone(UTC)
+                if abs((queued_at - event_instant).total_seconds()) > 5:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="O instante da outbox não corresponde ao evento.",
+                    )
+                max_age_seconds = app_settings.queued_event_max_age_seconds
             age_seconds = (received_at - event_instant).total_seconds()
-            if age_seconds > app_settings.event_max_age_seconds:
+            if age_seconds > max_age_seconds:
                 raise HTTPException(
                     status_code=422,
-                    detail="Evento antigo demais para o webhook em tempo real.",
+                    detail="Evento antigo demais para a janela de entrega.",
                 )
             if age_seconds < -app_settings.event_future_skew_seconds:
                 raise HTTPException(
@@ -337,7 +434,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         context = await asyncio.to_thread(
             repo.get_access_context,
             event.camera_id,
-            event.user_id,
+            (
+                event.user_id
+                if event.identity_status == IdentityStatus.MATCHED
+                else f"UNRESOLVED:{event.event_id}"
+            ),
             app_settings.policy_version,
         )
         camera = context.get("camera")
@@ -484,28 +585,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Evento não encontrado.")
         payload = event.get("raw_payload") or {}
         reference = payload.get("evidence_ref") if isinstance(payload, dict) else None
-        # Referência precisa ser exatamente um SHA-256 em hex: barra path traversal.
         if (
             not isinstance(reference, str)
             or len(reference) != 64
             or any(character not in "0123456789abcdef" for character in reference)
         ):
             raise HTTPException(status_code=404, detail="Evento sem foto associada.")
-        base = app_settings.evidence_dir.resolve()
-        candidates = (
-            [f"{reference}.thumb.jpg", f"{reference}.jpg"]
-            if variant == "thumb"
-            else [f"{reference}.jpg"]
-        )
-        photo_path = None
-        for filename in candidates:
-            candidate = (base / filename).resolve()
-            if candidate.parent == base and candidate.is_file():
-                photo_path = candidate
-                break
-        if photo_path is None:
-            raise HTTPException(status_code=404, detail="Foto indisponível.")
-        data = await asyncio.to_thread(photo_path.read_bytes)
+        store: EvidenceStore = request.app.state.evidence_store
+        try:
+            data = await asyncio.to_thread(store.read, reference, variant=variant)
+        except EvidenceNotFoundError:
+            if variant != "thumb":
+                raise HTTPException(status_code=404, detail="Foto indisponível.") from None
+            try:
+                data = await asyncio.to_thread(store.read, reference, variant="full")
+            except EvidenceNotFoundError:
+                raise HTTPException(status_code=404, detail="Foto indisponível.") from None
+            except EvidenceIntegrityError:
+                raise HTTPException(
+                    status_code=409,
+                    detail="A evidência falhou na verificação de integridade.",
+                ) from None
+        except EvidenceIntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="A evidência falhou na verificação de integridade.",
+            ) from None
         return Response(
             content=data,
             media_type="image/jpeg",

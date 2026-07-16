@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "policy_version": "2026.1",
+  "rooms": [
+    {
+      "room_id": "sala_ti_01",
+      "display_name": "Sala de TI 01",
+      "timezone": "America/Sao_Paulo",
+      "criticality": "CRITICAL"
+    }
+  ],
+  "cameras": [
+    {
+      "camera_id": "cam-ti-01",
+      "room_id": "sala_ti_01",
+      "active": true,
+      "recognition_threshold": 0.85
+    }
+  ],
+  "people": [
+    {
+      "person_id": "EMP001",
+      "display_name": "Pessoa autorizada",
+      "role_name": "Analista de Infraestrutura",
+      "department": "Infraestrutura",
+      "active": true
+    }
+  ],
+  "room_permissions": [
+    {
+      "person_id": "EMP001",
+      "room_id": "sala_ti_01"
+    }
+  ],
+  "work_schedules": [
+    {
+      "schedule_id": "SCH-EMP001-0",
+      "person_id": "EMP001",
+      "weekday": 0,
+      "start_time": "08:00",
+      "end_time": "18:00"
+    }
+  ],
+  "policies": [
+    {
+      "policy_id": "POL-001",
+      "version": "2026.1",
+      "applies_to_decision": "AUTHORIZED",
+      "title": "Acesso em horário regular",
+      "content": "Pessoa ativa, com permissão para a sala e dentro da escala possui contexto padrão.",
+      "reason_codes": [
+        "WITHIN_SCHEDULE",
+        "ROOM_PERMISSION_CONFIRMED"
+      ]
+    },
+    {
+      "policy_id": "POL-002",
+      "version": "2026.1",
+      "applies_to_decision": "JUSTIFIED",
+      "title": "Acesso emergencial fora do horário",
+      "content": "Um incidente urgente ativo pode justificar o contexto fora da escala.",
+      "reason_codes": [
+        "OUTSIDE_SCHEDULE",
+        "QUALIFYING_INCIDENT"
+      ]
+    },
+    {
+      "policy_id": "POL-003",
+      "version": "2026.1",
+      "applies_to_decision": "ANOMALY",
+      "title": "Acesso atípico",
+      "content": "Falta de permissão ou de contexto justificável exige revisão humana.",
+      "reason_codes": [
+        "NO_ROOM_PERMISSION",
+        "NO_QUALIFYING_INCIDENT",
+        "UNKNOWN_PERSON",
+        "INACTIVE_PERSON",
+        "UNKNOWN_CAMERA",
+        "LOW_RECOGNITION_CONFIDENCE"
+      ]
+    }
+  ]
+}

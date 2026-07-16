@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import pytest
 
 from app.vision.face_tracking import FaceCentroidTracker, IdentityConsensus
@@ -18,6 +19,36 @@ def face(x: float, y: float) -> DetectedFace:
 def decision(person_id: str, score: float = 0.8) -> MatchDecision:
     return MatchDecision(
         MatchStatus.MATCHED, person_id, f"Pessoa {person_id}", score, 0.2, 0.9
+    )
+
+
+def unresolved(status: MatchStatus = MatchStatus.UNKNOWN) -> MatchDecision:
+    return MatchDecision(status, None, None, 0.2, 0.05, 0.9)
+
+
+def embedding(index: int) -> np.ndarray:
+    value = np.zeros(512, dtype=np.float32)
+    value[index] = 1.0
+    return value
+
+
+def positioned_face(x: float, feature: np.ndarray) -> DetectedFace:
+    return DetectedFace(
+        (int(x * 1_000) - 50, 100, 100, 100),
+        (x, 0.3),
+        0.99,
+        0.90,
+        feature,
+    )
+
+
+def low_quality_positioned_face(x: float, feature: np.ndarray) -> DetectedFace:
+    return DetectedFace(
+        (int(x * 1_000) - 50, 100, 100, 100),
+        (x, 0.3),
+        0.99,
+        0.20,
+        feature,
     )
 
 
@@ -57,6 +88,123 @@ def test_competing_identities_are_not_forced_to_one_person() -> None:
     result = consensus.resolve("track")
     assert result.status == MatchStatus.AMBIGUOUS
     assert result.external_id is None
+
+
+def test_unknown_frames_count_against_consensus_support() -> None:
+    consensus = IdentityConsensus(history_size=30, minimum_matches=2)
+    for _ in range(28):
+        consensus.add("track", unresolved())
+    consensus.add("track", decision("EMP001"))
+    consensus.add("track", decision("EMP001"))
+
+    result = consensus.resolve("track")
+
+    assert result.status == MatchStatus.UNKNOWN
+    assert result.external_id is None
+
+
+def test_consensus_requires_recent_consecutive_support() -> None:
+    consensus = IdentityConsensus(
+        history_size=8,
+        minimum_matches=3,
+        minimum_ratio=0.60,
+        minimum_consecutive=2,
+    )
+    consensus.add("track", decision("EMP001"))
+    consensus.add("track", decision("EMP001"))
+    consensus.add("track", unresolved())
+    consensus.add("track", decision("EMP001"))
+
+    assert consensus.resolve("track").status == MatchStatus.UNKNOWN
+
+    consensus.add("track", decision("EMP001"))
+    assert consensus.resolve("track").status == MatchStatus.MATCHED
+
+
+def test_low_quality_frames_break_recent_identity_support() -> None:
+    consensus = IdentityConsensus(
+        history_size=8,
+        minimum_matches=3,
+        minimum_ratio=0.60,
+        minimum_consecutive=2,
+    )
+    for item in (
+        decision("EMP001"),
+        unresolved(MatchStatus.LOW_QUALITY),
+        decision("EMP001"),
+        unresolved(MatchStatus.LOW_QUALITY),
+        decision("EMP001"),
+    ):
+        consensus.add("track", item)
+
+    assert consensus.resolve("track").status == MatchStatus.UNKNOWN
+
+    consensus.add("track", decision("EMP001"))
+    consensus.add("track", decision("EMP001"))
+
+    assert consensus.resolve("track").status == MatchStatus.MATCHED
+
+
+def test_appearance_keeps_ids_when_two_faces_cross() -> None:
+    tracker = FaceCentroidTracker(boot_id="boot", max_distance=0.5)
+    first = tracker.update(
+        [
+            positioned_face(0.25, embedding(0)),
+            positioned_face(0.75, embedding(1)),
+        ],
+        NOW,
+    )
+    crossing = tracker.update(
+        [
+            positioned_face(0.48, embedding(1)),
+            positioned_face(0.52, embedding(0)),
+        ],
+        NOW + timedelta(seconds=1),
+    )
+    separated = tracker.update(
+        [
+            positioned_face(0.25, embedding(1)),
+            positioned_face(0.75, embedding(0)),
+        ],
+        NOW + timedelta(seconds=2),
+    )
+
+    assert [item.track_id for item in first] == ["boot:face-1", "boot:face-2"]
+    assert [item.track_id for item in crossing] == ["boot:face-2", "boot:face-1"]
+    assert [item.track_id for item in separated] == ["boot:face-2", "boot:face-1"]
+
+
+def test_low_quality_embedding_does_not_replace_track_appearance() -> None:
+    tracker = FaceCentroidTracker(boot_id="boot")
+    track_id = tracker.update([positioned_face(0.4, embedding(0))], NOW)[0].track_id
+
+    [updated] = tracker.update(
+        [low_quality_positioned_face(0.41, embedding(1))],
+        NOW + timedelta(milliseconds=250),
+    )
+
+    assert updated.track_id == track_id
+    assert tracker._tracks[track_id].appearance == tuple(embedding(0))
+
+
+def test_tracker_can_discard_or_reset_state() -> None:
+    tracker = FaceCentroidTracker(boot_id="boot")
+    track_id = tracker.update([face(0.2, 0.2)], NOW)[0].track_id
+
+    tracker.discard(track_id)
+    assert tracker.active_track_ids == ()
+
+    tracker.update([face(0.2, 0.2)], NOW + timedelta(seconds=1))
+    tracker.reset()
+    assert tracker.active_track_ids == ()
+    tracker.update([face(0.2, 0.2)], NOW)
+
+
+def test_observation_time_cannot_move_backwards() -> None:
+    tracker = FaceCentroidTracker()
+    tracker.update([face(0.1, 0.1)], NOW)
+    with pytest.raises(ValueError, match="retroceder"):
+        tracker.update([face(0.1, 0.1)], NOW - timedelta(milliseconds=1))
 
 
 def test_naive_datetime_is_rejected() -> None:
