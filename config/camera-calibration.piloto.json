@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "camera_id": "cam-ti-01",
+  "room_id": "sala_ti_01",
+  "_comentario": "Calibracao do piloto (v2.0) para a VIPC 1230 G2 de teto. Modelo 'sala inteira': a door_zone foi alargada para cobrir a area onde as pessoas ficam DENTRO da sala, nao so a soleira. entry_line removida de proposito (modo door nao a exige e sem ela nao ha validacao de geometria). Copie para data/private/config/camera-calibration.json.",
+  "door_zone": [[0.18, 0.18], [0.78, 0.18], [0.78, 0.98], [0.18, 0.98]],
+  "inside_zone": [[0.18, 0.55], [0.78, 0.55], [0.78, 0.98], [0.18, 0.98]],
+  "min_door_observations": 2,
+  "min_inside_observations": 2,
+  "track_timeout_seconds": 5,
+  "cooldown_seconds": 10
+}

@@ -46,6 +46,7 @@
   };
 
   const RANGE_LABELS = {
+    all: "Todo o período",
     today: "Hoje",
     "24h": "Últimas 24 horas",
     "7d": "Últimos 7 dias",
@@ -115,7 +116,7 @@
     offset: 0,
     limit: Number(elements.pageSize.value) || 25,
     total: 0,
-    activeRange: "today",
+    activeRange: "all",
     paused: false,
     eventSource: null,
     listController: null,
@@ -267,6 +268,12 @@
     }
     const now = new Date();
     let fromDate = now;
+    if (state.activeRange === "all") {
+      // Todo o período: sem início e sem fim, para nada ficar escondido por filtro.
+      elements.filterFrom.value = "";
+      elements.filterTo.value = "";
+      return;
+    }
     if (state.activeRange === "today") {
       const today = zonedInputValue(now).slice(0, 10);
       elements.filterFrom.value = `${today}T00:00`;
@@ -550,7 +557,9 @@
 
   function syncDashboardUrl(filterParams) {
     const pageParams = new URLSearchParams(filterParams);
-    if (state.activeRange) {
+    // "Tudo" é o padrão e não vai para a URL: assim um F5 volta ao estado livre
+    // em vez de congelar o recorte que estava aberto.
+    if (state.activeRange && state.activeRange !== "all") {
       pageParams.set("range", state.activeRange);
     }
     if (state.offset) {
@@ -1094,7 +1103,7 @@
       elements.filterFrom.value = isoToZonedInput(params.get("from"));
       elements.filterTo.value = isoToZonedInput(params.get("to"));
     } else {
-      state.activeRange = "today";
+      state.activeRange = "all";
       refreshQuickRangeValues();
     }
 
@@ -1123,7 +1132,7 @@
     elements.filterAlert.value = "";
     elements.filterQuery.value = "";
     clearFilterError();
-    setQuickRange("today", true);
+    setQuickRange("all", true);
   }
 
   function bindEvents() {
