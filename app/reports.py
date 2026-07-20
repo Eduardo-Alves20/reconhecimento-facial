@@ -99,7 +99,7 @@ def _footer(canvas, document) -> None:
     canvas.saveState()
     canvas.setFont("Helvetica", 7)
     canvas.setFillColor(colors.HexColor("#52606d"))
-    canvas.drawString(document.leftMargin, 9 * mm, "RAG-Audit · Relatório de auditoria")
+    canvas.drawString(document.leftMargin, 9 * mm, "QTA · Relatório de auditoria")
     canvas.drawRightString(
         document.pagesize[0] - document.rightMargin,
         9 * mm,
@@ -144,14 +144,14 @@ def build_event_pdf(event: dict[str, Any], timezone_name: str) -> bytes:
         leftMargin=18 * mm,
         topMargin=18 * mm,
         bottomMargin=18 * mm,
-        title=f"RAG-Audit - Evento {event['event_id']}",
-        author="RAG-Audit",
+        title=f"QTA - Evento {event['event_id']}",
+        author="QTA",
     )
     alert = event.get("alert") or {}
     context = event.get("context_snapshot") or {}
     observation = context.get("entry_observation") or {}
     story = [
-        Paragraph("RAG-Audit", styles["ReportTitle"]),
+        Paragraph("QTA", styles["ReportTitle"]),
         Paragraph("Relatório individual de evento de acesso", styles["Heading2"]),
         Paragraph(
             f"Gerado em {datetime.now(ZoneInfo(timezone_name)).strftime('%d/%m/%Y %H:%M:%S %z')}",
@@ -248,8 +248,8 @@ def build_consolidated_pdf(
         leftMargin=12 * mm,
         topMargin=14 * mm,
         bottomMargin=16 * mm,
-        title="RAG-Audit - Relatório consolidado",
-        author="RAG-Audit",
+        title="QTA - Relatório consolidado",
+        author="QTA",
     )
     counts = {
         key: sum(event["decision"] == value for event in events)
@@ -263,7 +263,7 @@ def build_consolidated_pdf(
         f"{key}={value}" for key, value in filters.items() if value not in (None, "")
     ) or "sem filtros adicionais"
     story = [
-        Paragraph("RAG-Audit", styles["ReportTitle"]),
+        Paragraph("QTA", styles["ReportTitle"]),
         Paragraph("Relatório consolidado de acessos", styles["Heading2"]),
         Paragraph(
             f"Gerado por {_safe(generated_by)} em "

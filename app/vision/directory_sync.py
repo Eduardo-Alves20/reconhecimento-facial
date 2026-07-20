@@ -1,4 +1,4 @@
-"""Sincroniza o manifesto sanitizado da galeria com o cadastro do RAG-Audit."""
+"""Sincroniza o manifesto sanitizado da galeria com o cadastro do QTA."""
 
 from __future__ import annotations
 

@@ -65,7 +65,7 @@ def test_read_and_pdf_routes_require_basic_auth(client: TestClient) -> None:
         invalid = client.get(path, auth=("auditor", "wrong-password"))
         assert missing.status_code == 401
         assert invalid.status_code == 401
-        assert missing.headers["www-authenticate"] == 'Basic realm="RAG-Audit"'
+        assert missing.headers["www-authenticate"] == 'Basic realm="QTA"'
 
 
 def test_individual_event_pdf_is_parseable_and_contains_audit_facts(
@@ -86,7 +86,7 @@ def test_individual_event_pdf_is_parseable_and_contains_audit_facts(
     text = _assert_valid_pdf(response)
 
     assert "evt-pdf-lucas" in response.headers["content-disposition"]
-    assert "RAG-Audit" in text
+    assert "QTA" in text
     assert "evt-pdf-lucas" in text
     assert "Lucas" in text
     assert "Sala de TI 01" in text

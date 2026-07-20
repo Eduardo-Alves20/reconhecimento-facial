@@ -151,7 +151,7 @@ def test_docs_and_sensitive_responses_are_protected_and_not_cacheable(
     listing = client.get("/v1/access-events", auth=admin_auth)
     assert docs.status_code == 200
     assert schema.status_code == 200
-    assert schema.json()["info"]["title"] == "RAG-Audit"
+    assert schema.json()["info"]["title"] == "QTA"
     assert listing.headers["cache-control"] == "no-store, max-age=0"
     assert listing.headers["x-content-type-options"] == "nosniff"
 

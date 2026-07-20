@@ -1,4 +1,4 @@
-"""Componentes de captura e visão computacional do RAG-Audit."""
+"""Componentes de captura e visão computacional do QTA."""
 
 from app.vision.camera import (
     CameraConfig,

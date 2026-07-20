@@ -1,1 +1,1 @@
-"""RAG-Audit application package."""
+"""QTA application package."""
