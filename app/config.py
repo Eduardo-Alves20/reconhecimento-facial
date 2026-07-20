@@ -32,7 +32,6 @@ def _environment_bool(name: str, default: bool) -> bool:
 
 
 def _real_token(value: str) -> str:
-    """Ignora o placeholder do .env.example para o token não parecer configurado."""
     token = value.strip()
     if not token or token.upper().startswith("COLE_AQUI"):
         return ""
@@ -94,20 +93,16 @@ class Settings:
     evidence_max_bytes: int = 10 * 1024 * 1024 * 1024
     evidence_max_item_bytes: int = 25 * 1024 * 1024
     evidence_evict_oldest: bool = True
-    # Login institucional (AD via CGE Environment API).
     ad_api_url: str | None = None
     ad_api_token: str = field(default="", repr=False)
     ad_allowed_groups: tuple[str, ...] = ()
     session_cookie_name: str = "rag_audit_sso"
     allow_basic_fallback: bool = True
-    # Homologação usa certificado autoassinado (CA interna). verify_ssl=False só
-    # para esse cenário; em produção use True (ou aponte ad_ca_cert para a CA).
     ad_verify_ssl: bool = True
     ad_ca_cert: str | None = None
 
     @property
     def ad_login_enabled(self) -> bool:
-        """Login AD está utilizável quando URL e token estão configurados."""
         return bool(self.ad_api_url and self.ad_api_token)
 
     @classmethod

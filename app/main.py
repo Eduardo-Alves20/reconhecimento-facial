@@ -103,8 +103,6 @@ def require_camera_key(
 
 
 class LoginRequired(Exception):
-    """Sinaliza que a rota exige login institucional (redireciona para /login)."""
-
     def __init__(self, next_url: str = "/dashboard", reason: str | None = None) -> None:
         self.next_url = next_url
         self.reason = reason
@@ -115,7 +113,6 @@ def _repository(request: Request) -> Repository:
 
 
 def _normalize_username(username: str) -> str:
-    """Chave canônica do usuário: sem domínio e minúscula (joao.silva@x -> joao.silva)."""
     return username.split("@", 1)[0].strip().lower()
 
 
@@ -127,7 +124,6 @@ def _client_ip(request: Request) -> str | None:
 
 
 def _current_session(request: Request) -> tuple[str, list[str]] | None:
-    """(username, grupos) se o cookie de sessão for válido E autorizado; senão None."""
     settings = _settings(request)
     if not settings.ad_login_enabled:
         return None
@@ -166,24 +162,20 @@ def require_admin(
     credentials: HTTPBasicCredentials | None = Depends(http_basic),
 ) -> str:
     settings = _settings(request)
-    # Com login AD configurado, a sessão institucional é a única porta.
     if settings.ad_login_enabled:
         session = _current_session(request)
         if session is None:
             raise LoginRequired(next_url=request.url.path)
         username = session[0]
-        # Lista de bloqueio local: sobrepõe o AD (bloqueado aqui não entra).
         if _repository(request).get_user_status(_normalize_username(username)) == "blocked":
             raise LoginRequired(next_url=request.url.path, reason="blocked")
         return username
-    # Sem AD configurado (ex.: token ainda não cadastrado): HTTP Basic em dev.
     if settings.allow_basic_fallback:
         return _basic_admin(request, credentials)
     raise LoginRequired(next_url=request.url.path)
 
 
 def _safe_next(target: str | None) -> str:
-    """Só aceita caminhos locais, para evitar open redirect."""
     if not target or not target.startswith("/") or target.startswith("//"):
         return "/dashboard"
     return target
@@ -201,15 +193,6 @@ def _set_session_cookie(
         secure=secure,
         path="/",
     )
-
-
-def _govbr_login_url(settings: Settings, next_url: str) -> str | None:
-    """URL do login gov.br. Stub: exige rota de callback própria, incremento futuro.
-
-    Retornar None mantém o botão "Entrar com gov.br" oculto no template até a
-    integração do callback estar pronta, evitando um botão que não funciona.
-    """
-    return None
 
 
 def _friendly_login_error(result: auth_ad.LoginResult) -> str:
@@ -432,7 +415,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "error": error,
                 "environment": app_settings.environment,
                 "ad_enabled": app_settings.ad_login_enabled,
-                "govbr_url": _govbr_login_url(app_settings, next_url),
             },
             status_code=http_status,
         )

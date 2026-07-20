@@ -1,4 +1,3 @@
-// Mostrar/ocultar a senha no campo de login (o "olhinho").
 (function () {
   const toggle = document.getElementById("togglePassword");
   const input = document.getElementById("password");

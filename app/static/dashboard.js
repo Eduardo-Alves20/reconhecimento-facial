@@ -269,7 +269,6 @@
     const now = new Date();
     let fromDate = now;
     if (state.activeRange === "all") {
-      // Todo o período: sem início e sem fim, para nada ficar escondido por filtro.
       elements.filterFrom.value = "";
       elements.filterTo.value = "";
       return;
@@ -557,8 +556,6 @@
 
   function syncDashboardUrl(filterParams) {
     const pageParams = new URLSearchParams(filterParams);
-    // "Tudo" é o padrão e não vai para a URL: assim um F5 volta ao estado livre
-    // em vez de congelar o recorte que estava aberto.
     if (state.activeRange && state.activeRange !== "all") {
       pageParams.set("range", state.activeRange);
     }

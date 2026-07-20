@@ -1,12 +1,3 @@
-"""Cliente do login institucional (AD) via CGE Environment API SDK.
-
-Encapsula o pacote ``cge_environment_api``. As chamadas são síncronas (o SDK usa
-urllib3), então as rotas FastAPI devem invocá-las com ``run_in_threadpool`` para
-não bloquear o event loop.
-
-Nenhuma senha é registrada em log. O token da aplicação vem de Settings e nunca
-aparece em mensagens de erro devolvidas ao cliente.
-"""
 from __future__ import annotations
 
 import json
@@ -45,7 +36,6 @@ class SessionResult:
 def _client(settings: Settings) -> cge_environment_api.ApiClient:
     configuration = cge_environment_api.Configuration(host=settings.ad_api_url)
     configuration.api_key["AuthorizationApi"] = settings.ad_api_token
-    # Homologação usa certificado autoassinado (CA interna da CGE).
     configuration.verify_ssl = settings.ad_verify_ssl
     if settings.ad_ca_cert:
         configuration.ssl_ca_cert = settings.ad_ca_cert
@@ -70,14 +60,12 @@ def authenticate(
     *,
     origin: str | None = None,
 ) -> LoginResult:
-    """Login AD por usuário/senha. Devolve token JWT + grupos em caso de sucesso."""
     request = AuthenticateUserRequest(
         username=username, password=password, origin=origin
     )
     try:
         with _client(settings) as api_client:
-            api = AuthenticationApi(api_client)
-            resp = api.authenticate_user(
+            resp = AuthenticationApi(api_client).authenticate_user(
                 authenticate_user_request=request, x_real_ip=origin
             )
     except ApiException as exc:
@@ -88,7 +76,7 @@ def authenticate(
             error_type=body.get("errorType"),
             http_status=exc.status,
         )
-    except Exception:  # noqa: BLE001 - falha de rede/SDK: não vazar detalhe
+    except Exception:  # noqa: BLE001
         logger.exception("Erro inesperado no login AD")
         return LoginResult(
             ok=False,
@@ -108,11 +96,11 @@ def authenticate(
 def verify_session(
     settings: Settings, token: str, *, origin: str | None = None
 ) -> SessionResult:
-    """Valida o JWT de sessão. Devolve username + grupos atuais do AD."""
     try:
         with _client(settings) as api_client:
-            api = AuthenticationApi(api_client)
-            resp = api.verify_session(authorizationldap=token, x_real_ip=origin)
+            resp = AuthenticationApi(api_client).verify_session(
+                authorizationldap=token, x_real_ip=origin
+            )
     except ApiException:
         return SessionResult(ok=False)
     except Exception:  # noqa: BLE001
@@ -127,20 +115,14 @@ def verify_session(
 
 
 def logoff(settings: Settings, token: str) -> None:
-    """Invalida a sessão SSO no servidor. Falha é silenciosa (best-effort)."""
     try:
         with _client(settings) as api_client:
             AuthenticationApi(api_client).logoff(authorizationldap=token)
     except Exception:  # noqa: BLE001
-        logger.debug("logoff AD falhou; seguindo com a limpeza local do cookie")
+        logger.debug("logoff AD falhou")
 
 
 def is_authorized(groups: list[str], allowed_groups: tuple[str, ...]) -> bool:
-    """Autorizado se pertencer a pelo menos um grupo permitido.
-
-    Sem grupos permitidos configurados, qualquer usuário autenticado passa.
-    Comparação é case-insensitive pelo nome do grupo.
-    """
     if not allowed_groups:
         return True
     present = {g.strip().upper() for g in groups}

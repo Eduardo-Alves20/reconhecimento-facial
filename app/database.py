@@ -850,7 +850,6 @@ class Repository:
         ip: str | None,
         now: datetime,
     ) -> None:
-        """Upsert do usuário no login. Preserva status (um bloqueado continua bloqueado)."""
         now_text = utc_iso(now)
         groups_json = json.dumps(groups, ensure_ascii=False)
         with self.connect() as connection:

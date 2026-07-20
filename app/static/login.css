@@ -173,36 +173,6 @@ body {
 .btn-primary:hover { background: var(--azul-forte); }
 .btn-primary:focus-visible { outline: 3px solid rgba(10, 61, 128, 0.4); }
 
-.divider {
-  display: flex;
-  align-items: center;
-  text-align: center;
-  color: var(--cinza);
-  font-size: 13px;
-  margin: 18px 0;
-}
-.divider::before, .divider::after {
-  content: "";
-  flex: 1;
-  height: 1px;
-  background: var(--borda);
-}
-.divider span { padding: 0 12px; }
-
-.btn-govbr {
-  display: block;
-  text-align: center;
-  text-decoration: none;
-  background: #f3f4f6;
-  color: var(--texto);
-  border: 1px solid var(--borda);
-  border-radius: 8px;
-  padding: 12px;
-  font-size: 15px;
-  font-weight: 600;
-}
-.btn-govbr:hover { background: #eceef1; }
-
 .warn {
   text-align: center;
   color: #a86b3d;
