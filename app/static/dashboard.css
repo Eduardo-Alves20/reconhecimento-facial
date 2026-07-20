@@ -564,6 +564,19 @@ h3 {
   background: rgba(255, 255, 255, 0.12);
 }
 
+.button--logout {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  color: #ffd9d9;
+  border-color: rgba(248, 113, 113, 0.4);
+}
+
+.button--logout:hover {
+  background: rgba(248, 113, 113, 0.18);
+  border-color: rgba(248, 113, 113, 0.6);
+}
+
 .button--compact {
   min-height: 34px;
   padding: 6px 10px;

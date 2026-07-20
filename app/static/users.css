@@ -1,0 +1,120 @@
+.users-main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 28px 24px 60px;
+}
+
+.users-head h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+  color: #0f172a;
+}
+
+.users-sub {
+  margin: 0 0 22px;
+  color: #475569;
+  font-size: 14px;
+  max-width: 760px;
+  line-height: 1.5;
+}
+
+.users-notice {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #b91c1c;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  margin-bottom: 18px;
+}
+
+.users-table-wrap {
+  overflow-x: auto;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.05);
+}
+
+.users-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  min-width: 820px;
+}
+
+.users-table thead th {
+  text-align: left;
+  background: #f8fafc;
+  color: #475569;
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 12px 14px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.users-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid #f1f5f9;
+  color: #1f2937;
+  vertical-align: middle;
+}
+
+.users-table tr:last-child td { border-bottom: none; }
+.users-table tr.is-blocked { background: #fff7f7; }
+
+.users-table .mono {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 13px;
+}
+.users-table .num { text-align: right; }
+.users-table .groups { color: #475569; font-size: 13px; max-width: 260px; }
+.users-table .empty { text-align: center; color: #94a3b8; padding: 28px; }
+
+.you {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 11px;
+  background: #e0edff;
+  color: #1d4ed8;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-family: system-ui, sans-serif;
+}
+
+.badge {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 700;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+.badge--active { background: #dcfce7; color: #15803d; }
+.badge--blocked { background: #fee2e2; color: #b91c1c; }
+
+.actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.actions form { margin: 0; }
+.actions .muted { color: #cbd5e1; }
+
+.btn {
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: #f1f5f9;
+  color: #334155;
+}
+.btn--ok { background: #dcfce7; color: #15803d; border-color: #bbf7d0; }
+.btn--ok:hover { background: #bbf7d0; }
+.btn--warn { background: #fef3c7; color: #b45309; border-color: #fde68a; }
+.btn--warn:hover { background: #fde68a; }
+.btn--danger { background: #fee2e2; color: #b91c1c; border-color: #fecaca; }
+.btn--danger:hover { background: #fecaca; }

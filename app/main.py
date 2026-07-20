@@ -105,8 +105,18 @@ def require_camera_key(
 class LoginRequired(Exception):
     """Sinaliza que a rota exige login institucional (redireciona para /login)."""
 
-    def __init__(self, next_url: str = "/dashboard") -> None:
+    def __init__(self, next_url: str = "/dashboard", reason: str | None = None) -> None:
         self.next_url = next_url
+        self.reason = reason
+
+
+def _repository(request: Request) -> Repository:
+    return request.app.state.repository
+
+
+def _normalize_username(username: str) -> str:
+    """Chave canônica do usuário: sem domínio e minúscula (joao.silva@x -> joao.silva)."""
+    return username.split("@", 1)[0].strip().lower()
 
 
 def _client_ip(request: Request) -> str | None:
@@ -159,9 +169,13 @@ def require_admin(
     # Com login AD configurado, a sessão institucional é a única porta.
     if settings.ad_login_enabled:
         session = _current_session(request)
-        if session is not None:
-            return session[0]
-        raise LoginRequired(next_url=request.url.path)
+        if session is None:
+            raise LoginRequired(next_url=request.url.path)
+        username = session[0]
+        # Lista de bloqueio local: sobrepõe o AD (bloqueado aqui não entra).
+        if _repository(request).get_user_status(_normalize_username(username)) == "blocked":
+            raise LoginRequired(next_url=request.url.path, reason="blocked")
+        return username
     # Sem AD configurado (ex.: token ainda não cadastrado): HTTP Basic em dev.
     if settings.allow_basic_fallback:
         return _basic_admin(request, credentials)
@@ -369,11 +383,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
         if request.url.path.startswith(
-            ("/v1/", "/dashboard", "/docs", "/openapi", "/login", "/logout")
+            ("/v1/", "/dashboard", "/docs", "/openapi", "/login", "/logout", "/users")
         ):
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["Pragma"] = "no-cache"
-        if request.url.path in ("/dashboard", "/login"):
+        if request.url.path in ("/dashboard", "/login") or request.url.path.startswith(
+            "/users"
+        ):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
@@ -381,12 +397,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return response
 
+    _LOGIN_MESSAGES = {
+        "blocked": "Seu acesso a este painel foi bloqueado por um administrador.",
+        "expired": "Sua sessão expirou. Entre novamente.",
+    }
+
     @application.exception_handler(LoginRequired)
     async def _login_required_handler(request: Request, exc: LoginRequired):
         if "text/html" in request.headers.get("accept", ""):
             target = _safe_next(exc.next_url)
-            suffix = f"?next={quote(target, safe='')}" if target != "/dashboard" else ""
-            return RedirectResponse(url=f"/login{suffix}", status_code=303)
+            params = []
+            if target != "/dashboard":
+                params.append(f"next={quote(target, safe='')}")
+            if exc.reason:
+                params.append(f"e={exc.reason}")
+            suffix = f"?{'&'.join(params)}" if params else ""
+            response = RedirectResponse(url=f"/login{suffix}", status_code=303)
+            if exc.reason == "blocked":
+                response.delete_cookie(app_settings.session_cookie_name, path="/")
+            return response
         return JSONResponse(
             {"detail": "Autenticação institucional necessária."},
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -409,11 +438,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     @application.get("/login", include_in_schema=False)
-    async def login_page(request: Request, next: str = "/dashboard") -> Response:
+    async def login_page(
+        request: Request, next: str = "/dashboard", e: str | None = None
+    ) -> Response:
         target = _safe_next(next)
         if app_settings.ad_login_enabled and _current_session(request) is not None:
-            return RedirectResponse(url=target, status_code=303)
-        return _render_login(request, next_url=target, error=None)
+            if _repository(request).get_user_status(
+                _normalize_username(_current_session(request)[0])
+            ) != "blocked":
+                return RedirectResponse(url=target, status_code=303)
+        return _render_login(
+            request, next_url=target, error=_LOGIN_MESSAGES.get(e or "")
+        )
 
     @application.post("/login", include_in_schema=False)
     def login_submit(
@@ -447,6 +483,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 error="Seu usuário não tem permissão de acesso a este painel.",
                 http_status=403,
             )
+        canonical = _normalize_username(result.username or username)
+        repository = _repository(request)
+        if repository.get_user_status(canonical) == "blocked":
+            return _render_login(
+                request,
+                next_url=target,
+                error=_LOGIN_MESSAGES["blocked"],
+                http_status=403,
+            )
+        repository.record_login(
+            canonical,
+            display_name=result.display_name,
+            groups=result.groups,
+            ip=_client_ip(request),
+            now=utc_now(),
+        )
         response = RedirectResponse(url=target, status_code=303)
         _set_session_cookie(response, request, app_settings, result.token or "")
         return response
@@ -459,6 +511,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response = RedirectResponse(url="/login", status_code=303)
         response.delete_cookie(app_settings.session_cookie_name, path="/")
         return response
+
+    @application.get("/users", include_in_schema=False, response_class=HTMLResponse)
+    async def users_panel(
+        request: Request, admin: str = Depends(require_admin), err: str | None = None
+    ) -> Response:
+        notices = {
+            "self": "Você não pode bloquear ou excluir o próprio usuário.",
+            "notfound": "Usuário não encontrado.",
+        }
+        return templates.TemplateResponse(
+            request=request,
+            name="users.html",
+            context={
+                "users": repository.list_system_users(),
+                "admin": admin,
+                "current_user": _normalize_username(admin),
+                "environment": app_settings.environment,
+                "allowed_groups": ", ".join(app_settings.ad_allowed_groups) or "(qualquer)",
+                "notice": notices.get(err or ""),
+            },
+        )
+
+    def _guard_self(admin: str, target: str) -> str | None:
+        if _normalize_username(target) == _normalize_username(admin):
+            return "/users?err=self"
+        return None
+
+    @application.post("/users/{username}/block", include_in_schema=False)
+    def user_block(
+        request: Request, username: str, admin: str = Depends(require_admin)
+    ) -> Response:
+        blocked = _guard_self(admin, username)
+        if blocked:
+            return RedirectResponse(url=blocked, status_code=303)
+        repository.set_user_status(_normalize_username(username), "blocked")
+        return RedirectResponse(url="/users", status_code=303)
+
+    @application.post("/users/{username}/unblock", include_in_schema=False)
+    def user_unblock(
+        request: Request, username: str, admin: str = Depends(require_admin)
+    ) -> Response:
+        repository.set_user_status(_normalize_username(username), "active")
+        return RedirectResponse(url="/users", status_code=303)
+
+    @application.post("/users/{username}/delete", include_in_schema=False)
+    def user_delete(
+        request: Request, username: str, admin: str = Depends(require_admin)
+    ) -> Response:
+        blocked = _guard_self(admin, username)
+        if blocked:
+            return RedirectResponse(url=blocked, status_code=303)
+        repository.delete_system_user(_normalize_username(username))
+        return RedirectResponse(url="/users", status_code=303)
 
     @application.get("/", include_in_schema=False)
     async def root() -> RedirectResponse:

@@ -100,6 +100,10 @@ class Settings:
     ad_allowed_groups: tuple[str, ...] = ()
     session_cookie_name: str = "rag_audit_sso"
     allow_basic_fallback: bool = True
+    # Homologação usa certificado autoassinado (CA interna). verify_ssl=False só
+    # para esse cenário; em produção use True (ou aponte ad_ca_cert para a CA).
+    ad_verify_ssl: bool = True
+    ad_ca_cert: str | None = None
 
     @property
     def ad_login_enabled(self) -> bool:
@@ -184,6 +188,8 @@ class Settings:
             allow_basic_fallback=_environment_bool(
                 "RAG_AUDIT_ALLOW_BASIC_FALLBACK", not production
             ),
+            ad_verify_ssl=_environment_bool("CGE_ENV_API_VERIFY_SSL", True),
+            ad_ca_cert=(os.getenv("CGE_ENV_API_CA_CERT", "").strip() or None),
         )
 
     def camera_key_for(self, camera_id: str) -> str | None:

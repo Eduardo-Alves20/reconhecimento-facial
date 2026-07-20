@@ -34,10 +34,13 @@
         <button id="liveToggle" class="button button--header" type="button" aria-pressed="false">
           Pausar atualização
         </button>
+        <a class="button button--header" href="/users" title="Gerenciar usuários">Usuários</a>
         <span class="admin-chip" title="Usuário autenticado">
           <span aria-hidden="true">●</span>
           {{ admin }}
         </span>
+        <a id="logoutLink" class="button button--header button--logout" href="/logout"
+           title="Encerrar a sessão">Sair</a>
       </div>
     </div>
   </header>

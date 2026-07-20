@@ -45,6 +45,14 @@ class SessionResult:
 def _client(settings: Settings) -> cge_environment_api.ApiClient:
     configuration = cge_environment_api.Configuration(host=settings.ad_api_url)
     configuration.api_key["AuthorizationApi"] = settings.ad_api_token
+    # Homologação usa certificado autoassinado (CA interna da CGE).
+    configuration.verify_ssl = settings.ad_verify_ssl
+    if settings.ad_ca_cert:
+        configuration.ssl_ca_cert = settings.ad_ca_cert
+    if not settings.ad_verify_ssl:
+        import urllib3
+
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return cge_environment_api.ApiClient(configuration)
 
 

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Usuários · RAG-Audit</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', path='/users.css') }}">
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-header__inner">
+      <div class="brand" aria-label="RAG-Audit">
+        <span class="brand__mark" aria-hidden="true">RA</span>
+        <span>
+          <strong class="brand__name">RAG-Audit</strong>
+          <small class="brand__descriptor">Usuários do sistema</small>
+        </span>
+      </div>
+      <div class="header-status">
+        <span class="environment-badge">{{ environment }}</span>
+        <a class="button button--header" href="/dashboard">← Painel</a>
+        <span class="admin-chip" title="Usuário autenticado">
+          <span aria-hidden="true">●</span> {{ admin }}
+        </span>
+        <a class="button button--header button--logout" href="/logout">Sair</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="users-main">
+    <div class="users-head">
+      <h1>Usuários do sistema</h1>
+      <p class="users-sub">
+        Quem já entrou pelo login institucional. Acesso liberado para os grupos:
+        <strong>{{ allowed_groups }}</strong>. Bloquear nega a entrada aqui, sem
+        alterar o AD. Excluir remove só o histórico local.
+      </p>
+    </div>
+
+    {% if notice %}
+    <div class="users-notice" role="alert">{{ notice }}</div>
+    {% endif %}
+
+    <div class="users-table-wrap">
+      <table class="users-table">
+        <thead>
+          <tr>
+            <th>Usuário</th>
+            <th>Nome</th>
+            <th>Grupos (AD)</th>
+            <th>Último acesso (UTC)</th>
+            <th class="num">Logins</th>
+            <th>Status</th>
+            <th>Ações</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for u in users %}
+          <tr class="{{ 'is-blocked' if u.status == 'blocked' else '' }}">
+            <td class="mono">
+              {{ u.username }}
+              {% if u.username == current_user %}<span class="you">você</span>{% endif %}
+            </td>
+            <td>{{ u.display_name or '—' }}</td>
+            <td class="groups">{{ u.ad_groups | join(', ') if u.ad_groups else '—' }}</td>
+            <td class="mono">{{ (u.last_seen[:19] | replace('T', ' ')) if u.last_seen else '—' }}</td>
+            <td class="num">{{ u.login_count }}</td>
+            <td>
+              {% if u.status == 'blocked' %}
+                <span class="badge badge--blocked">Bloqueado</span>
+              {% else %}
+                <span class="badge badge--active">Ativo</span>
+              {% endif %}
+            </td>
+            <td class="actions">
+              {% if u.username == current_user %}
+                <span class="muted">—</span>
+              {% else %}
+                {% if u.status == 'blocked' %}
+                <form method="post" action="/users/{{ u.username }}/unblock">
+                  <button class="btn btn--ok" type="submit">Desbloquear</button>
+                </form>
+                {% else %}
+                <form method="post" action="/users/{{ u.username }}/block">
+                  <button class="btn btn--warn" type="submit">Bloquear</button>
+                </form>
+                {% endif %}
+                <form method="post" action="/users/{{ u.username }}/delete"
+                      onsubmit="return confirm('Excluir o registro de {{ u.username }}? Ele reaparece se logar de novo.');">
+                  <button class="btn btn--danger" type="submit">Excluir</button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="7" class="empty">Ninguém logou pelo AD ainda.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>

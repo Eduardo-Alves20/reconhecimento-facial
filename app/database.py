@@ -129,6 +129,20 @@ CREATE INDEX IF NOT EXISTS idx_access_events_decision
     ON access_events(decision, risk_level);
 CREATE INDEX IF NOT EXISTS idx_alert_outbox_delivery
     ON alert_outbox(status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS system_users (
+    username TEXT PRIMARY KEY,
+    display_name TEXT,
+    ad_groups TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    last_ip TEXT,
+    login_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_users_last_seen
+    ON system_users(last_seen DESC);
 """
 
 
@@ -824,6 +838,80 @@ class Repository:
                 "SELECT room_id, display_name, criticality FROM rooms ORDER BY display_name"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ----- Usuários do sistema (login institucional) -----
+
+    def record_login(
+        self,
+        username: str,
+        *,
+        display_name: str | None,
+        groups: list[str],
+        ip: str | None,
+        now: datetime,
+    ) -> None:
+        """Upsert do usuário no login. Preserva status (um bloqueado continua bloqueado)."""
+        now_text = utc_iso(now)
+        groups_json = json.dumps(groups, ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO system_users (
+                    username, display_name, ad_groups, status,
+                    first_seen, last_seen, last_ip, login_count
+                ) VALUES (?, ?, ?, 'active', ?, ?, ?, 1)
+                ON CONFLICT(username) DO UPDATE SET
+                    display_name = excluded.display_name,
+                    ad_groups = excluded.ad_groups,
+                    last_seen = excluded.last_seen,
+                    last_ip = excluded.last_ip,
+                    login_count = system_users.login_count + 1
+                """,
+                (username, display_name, groups_json, now_text, now_text, ip),
+            )
+            connection.commit()
+
+    def get_user_status(self, username: str) -> str | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM system_users WHERE username = ?", (username,)
+            ).fetchone()
+        return row["status"] if row else None
+
+    def list_system_users(self) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM system_users ORDER BY last_seen DESC"
+            ).fetchall()
+        result = []
+        for row in rows:
+            data = dict(row)
+            try:
+                data["ad_groups"] = json.loads(data.get("ad_groups") or "[]")
+            except (ValueError, TypeError):
+                data["ad_groups"] = []
+            result.append(data)
+        return result
+
+    def set_user_status(self, username: str, status: str) -> bool:
+        if status not in ("active", "blocked"):
+            raise ValueError("status deve ser 'active' ou 'blocked'")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE system_users SET status = ? WHERE username = ?",
+                (status, username),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    def delete_system_user(self, username: str) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM system_users WHERE username = ?", (username,)
+            )
+            connection.commit()
+        return cursor.rowcount > 0
 
     def claim_pending_alerts(
         self,
