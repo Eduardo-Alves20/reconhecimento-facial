@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+# Configuração unica em .env (API + worker + login). .env.api ainda é lido se
+# existir, para compatibilidade com deploys que separam os segredos por processo.
 load_dotenv(PROJECT_DIR / ".env.api")
 load_dotenv(PROJECT_DIR / ".env")
 
@@ -27,6 +29,14 @@ def _environment_bool(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} deve ser true ou false")
+
+
+def _real_token(value: str) -> str:
+    """Ignora o placeholder do .env.example para o token não parecer configurado."""
+    token = value.strip()
+    if not token or token.upper().startswith("COLE_AQUI"):
+        return ""
+    return token
 
 
 def _camera_keys_from_env() -> tuple[tuple[str, str], ...]:
@@ -84,6 +94,17 @@ class Settings:
     evidence_max_bytes: int = 10 * 1024 * 1024 * 1024
     evidence_max_item_bytes: int = 25 * 1024 * 1024
     evidence_evict_oldest: bool = True
+    # Login institucional (AD via CGE Environment API).
+    ad_api_url: str | None = None
+    ad_api_token: str = field(default="", repr=False)
+    ad_allowed_groups: tuple[str, ...] = ()
+    session_cookie_name: str = "rag_audit_sso"
+    allow_basic_fallback: bool = True
+
+    @property
+    def ad_login_enabled(self) -> bool:
+        """Login AD está utilizável quando URL e token estão configurados."""
+        return bool(self.ad_api_url and self.ad_api_token)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -148,6 +169,20 @@ class Settings:
             evidence_evict_oldest=_environment_bool(
                 "RAG_AUDIT_EVIDENCE_EVICT_OLDEST",
                 True,
+            ),
+            ad_api_url=(os.getenv("CGE_ENV_API_URL", "").strip().rstrip("/") or None),
+            ad_api_token=_real_token(os.getenv("CGE_ENV_API_TOKEN", "")),
+            ad_allowed_groups=tuple(
+                g.strip()
+                for g in os.getenv("RAG_AUDIT_ALLOWED_AD_GROUPS", "").split(",")
+                if g.strip()
+            ),
+            session_cookie_name=os.getenv(
+                "RAG_AUDIT_SESSION_COOKIE", "rag_audit_sso"
+            ).strip()
+            or "rag_audit_sso",
+            allow_basic_fallback=_environment_bool(
+                "RAG_AUDIT_ALLOW_BASIC_FALLBACK", not production
             ),
         )
 

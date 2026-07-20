@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Acesso institucional · RAG-Audit</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/login.css') }}">
+  <script src="{{ url_for('static', path='/login.js') }}" defer></script>
+</head>
+<body>
+  <main class="login-wrap">
+    <section class="login-card" aria-labelledby="login-title">
+      <header class="brand">
+        <div class="brand-left">Controladoria-Geral<br>do Estado</div>
+        <div class="brand-right">
+          <span class="brand-emblem" aria-hidden="true">RJ</span>
+          <span class="brand-gov">GOVERNO DO ESTADO<br><strong>RIO DE JANEIRO</strong></span>
+        </div>
+      </header>
+
+      <h1 id="login-title" class="app-title">RAG-Audit</h1>
+      <p class="app-subtitle">Acesso institucional</p>
+
+      {% if error %}
+      <div class="alert" role="alert">{{ error }}</div>
+      {% endif %}
+
+      <form class="login-form" method="post" action="/login" novalidate>
+        <input type="hidden" name="next" value="{{ next }}">
+
+        <label class="field-label" for="username">Usuário de Rede:</label>
+        <input class="field" id="username" name="username" type="text"
+               autocomplete="username" autocapitalize="none" spellcheck="false"
+               placeholder="Insira seu usuário de rede..." required autofocus>
+
+        <label class="field-label" for="password">Senha:</label>
+        <div class="password-row">
+          <input class="field" id="password" name="password" type="password"
+                 autocomplete="current-password"
+                 placeholder="Insira sua senha..." required>
+          <button class="toggle-password" type="button" id="togglePassword"
+                  aria-label="Mostrar senha" aria-pressed="false">
+            <span aria-hidden="true" data-eye>&#128065;</span>
+          </button>
+        </div>
+
+        <button class="btn-primary" type="submit">Entrar</button>
+
+        {% if govbr_url %}
+        <div class="divider"><span>ou</span></div>
+        <a class="btn-govbr" href="{{ govbr_url }}">
+          Entrar com <strong>gov.br</strong>
+        </a>
+        {% endif %}
+
+        <p class="warn">Nunca compartilhe sua senha com terceiros.</p>
+      </form>
+    </section>
+
+    {% if environment != "production" %}
+    <p class="env-badge">AMBIENTE DE HOMOLOGAÇÃO</p>
+    {% endif %}
+  </main>
+</body>
+</html>

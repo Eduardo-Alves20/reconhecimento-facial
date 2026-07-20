@@ -1,0 +1,227 @@
+:root {
+  --azul: #0a3d80;
+  --azul-forte: #08356f;
+  --texto: #1f2937;
+  --cinza: #6b7280;
+  --borda: #e5e7eb;
+  --fundo: #f3f4f6;
+  --erro-bg: #fef2f2;
+  --erro-borda: #fecaca;
+  --erro-txt: #b91c1c;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--fundo);
+  color: var(--texto);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  padding: 24px;
+}
+
+.login-wrap {
+  width: 100%;
+  max-width: 440px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+}
+
+.login-card {
+  width: 100%;
+  background: #fff;
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.12);
+  padding: 28px 32px 32px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: #f7f8fa;
+  border: 1px solid var(--borda);
+  border-radius: 10px;
+  padding: 12px 16px;
+  margin-bottom: 26px;
+}
+
+.brand-left {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--texto);
+}
+
+.brand-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.brand-emblem {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--azul);
+  color: #fff;
+  font-weight: 800;
+  font-size: 13px;
+}
+
+.brand-gov {
+  font-size: 10.5px;
+  line-height: 1.2;
+  color: var(--cinza);
+  letter-spacing: 0.02em;
+}
+
+.brand-gov strong { color: var(--texto); }
+
+.app-title {
+  text-align: center;
+  color: var(--azul);
+  font-size: 34px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  margin: 8px 0 2px;
+}
+
+.app-subtitle {
+  text-align: center;
+  color: var(--cinza);
+  font-size: 14px;
+  margin: 0 0 22px;
+}
+
+.alert {
+  background: var(--erro-bg);
+  border: 1px solid var(--erro-borda);
+  color: var(--erro-txt);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  margin-bottom: 18px;
+}
+
+.login-form { display: flex; flex-direction: column; }
+
+.field-label {
+  font-size: 14px;
+  font-weight: 700;
+  margin: 12px 0 6px;
+}
+
+.field {
+  width: 100%;
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 15px;
+  background: #fcfcfd;
+  transition: border-color .15s, box-shadow .15s;
+}
+
+.field::placeholder { color: #9aa3af; }
+
+.field:focus {
+  outline: none;
+  border-color: var(--azul);
+  box-shadow: 0 0 0 3px rgba(10, 61, 128, 0.12);
+}
+
+.password-row { position: relative; display: flex; align-items: center; }
+.password-row .field { padding-right: 46px; }
+
+.toggle-password {
+  position: absolute;
+  right: 6px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 8px;
+  font-size: 16px;
+  line-height: 1;
+  opacity: 0.55;
+  border-radius: 6px;
+}
+.toggle-password:hover { opacity: 0.9; }
+.toggle-password:focus-visible { outline: 2px solid var(--azul); }
+
+.btn-primary {
+  margin-top: 22px;
+  background: var(--azul);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 13px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background .15s;
+}
+.btn-primary:hover { background: var(--azul-forte); }
+.btn-primary:focus-visible { outline: 3px solid rgba(10, 61, 128, 0.4); }
+
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--cinza);
+  font-size: 13px;
+  margin: 18px 0;
+}
+.divider::before, .divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--borda);
+}
+.divider span { padding: 0 12px; }
+
+.btn-govbr {
+  display: block;
+  text-align: center;
+  text-decoration: none;
+  background: #f3f4f6;
+  color: var(--texto);
+  border: 1px solid var(--borda);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+.btn-govbr:hover { background: #eceef1; }
+
+.warn {
+  text-align: center;
+  color: #a86b3d;
+  font-size: 12.5px;
+  margin: 18px 0 0;
+}
+
+.env-badge {
+  background: #fde8ec;
+  color: #b4315a;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  padding: 6px 16px;
+  border-radius: 999px;
+  margin: 0;
+}
+
+@media (max-width: 480px) {
+  .login-card { padding: 22px 20px 26px; }
+  .app-title { font-size: 28px; }
+}

@@ -1,3 +1,10 @@
+# SDK do login institucional (AD via CGE Environment API). Pacote privado no
+# GitLab da CGE; localmente pode-se instalar do fonte clonado:
+#   pip install -e ../environment-sdk/python
+--extra-index-url https://gitlab.cge.rj.gov.br/api/v4/projects/180/packages/pypi/simple
+cge-environment-api==2.9.200
+python-multipart==0.0.32
+
 annotated-types==0.7.0
 anyio==4.14.2
 certifi==2026.6.17

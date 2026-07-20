@@ -8,12 +8,14 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from typing import AsyncIterator
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import (
     BackgroundTasks,
     Depends,
     FastAPI,
+    Form,
     Header,
     HTTPException,
     Query,
@@ -26,6 +28,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import auth_ad
 from .alerts import AlertWorker
 from .config import PROJECT_DIR, Settings
 from .database import Repository, utc_now
@@ -99,10 +102,37 @@ def require_camera_key(
         )
 
 
-def require_admin(
-    request: Request,
-    credentials: HTTPBasicCredentials | None = Depends(http_basic),
-) -> str:
+class LoginRequired(Exception):
+    """Sinaliza que a rota exige login institucional (redireciona para /login)."""
+
+    def __init__(self, next_url: str = "/dashboard") -> None:
+        self.next_url = next_url
+
+
+def _client_ip(request: Request) -> str | None:
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def _current_session(request: Request) -> tuple[str, list[str]] | None:
+    """(username, grupos) se o cookie de sessão for válido E autorizado; senão None."""
+    settings = _settings(request)
+    if not settings.ad_login_enabled:
+        return None
+    token = request.cookies.get(settings.session_cookie_name)
+    if not token:
+        return None
+    result = auth_ad.verify_session(settings, token, origin=_client_ip(request))
+    if not result.ok:
+        return None
+    if not auth_ad.is_authorized(result.groups, settings.ad_allowed_groups):
+        return None
+    return result.username or "?", result.groups
+
+
+def _basic_admin(request: Request, credentials: HTTPBasicCredentials | None) -> str:
     settings = _settings(request)
     username = credentials.username if credentials else ""
     password = credentials.password if credentials else ""
@@ -119,6 +149,61 @@ def require_admin(
             headers={"WWW-Authenticate": 'Basic realm="RAG-Audit"'},
         )
     return username
+
+
+def require_admin(
+    request: Request,
+    credentials: HTTPBasicCredentials | None = Depends(http_basic),
+) -> str:
+    settings = _settings(request)
+    # Com login AD configurado, a sessão institucional é a única porta.
+    if settings.ad_login_enabled:
+        session = _current_session(request)
+        if session is not None:
+            return session[0]
+        raise LoginRequired(next_url=request.url.path)
+    # Sem AD configurado (ex.: token ainda não cadastrado): HTTP Basic em dev.
+    if settings.allow_basic_fallback:
+        return _basic_admin(request, credentials)
+    raise LoginRequired(next_url=request.url.path)
+
+
+def _safe_next(target: str | None) -> str:
+    """Só aceita caminhos locais, para evitar open redirect."""
+    if not target or not target.startswith("/") or target.startswith("//"):
+        return "/dashboard"
+    return target
+
+
+def _set_session_cookie(
+    response: Response, request: Request, settings: Settings, token: str
+) -> None:
+    secure = request.url.scheme == "https" or settings.environment == "production"
+    response.set_cookie(
+        key=settings.session_cookie_name,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path="/",
+    )
+
+
+def _govbr_login_url(settings: Settings, next_url: str) -> str | None:
+    """URL do login gov.br. Stub: exige rota de callback própria, incremento futuro.
+
+    Retornar None mantém o botão "Entrar com gov.br" oculto no template até a
+    integração do callback estar pronta, evitando um botão que não funciona.
+    """
+    return None
+
+
+def _friendly_login_error(result: auth_ad.LoginResult) -> str:
+    if result.error_type == "PASSWORD_CHANGE_REQUIRED":
+        return "Sua senha expirou. Troque a senha de rede no AD e tente de novo."
+    if result.http_status == 503:
+        return "Serviço de autenticação indisponível. Tente novamente em instantes."
+    return result.message or "Usuário ou senha inválidos."
 
 
 def _canonical_payload(event: AccessEventIn) -> tuple[dict, str]:
@@ -283,15 +368,96 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["X-Frame-Options"] = "DENY"
-        if request.url.path.startswith(("/v1/", "/dashboard", "/docs", "/openapi")):
+        if request.url.path.startswith(
+            ("/v1/", "/dashboard", "/docs", "/openapi", "/login", "/logout")
+        ):
             response.headers["Cache-Control"] = "no-store, max-age=0"
             response.headers["Pragma"] = "no-cache"
-        if request.url.path == "/dashboard":
+        if request.url.path in ("/dashboard", "/login"):
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
                 "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
                 "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
             )
+        return response
+
+    @application.exception_handler(LoginRequired)
+    async def _login_required_handler(request: Request, exc: LoginRequired):
+        if "text/html" in request.headers.get("accept", ""):
+            target = _safe_next(exc.next_url)
+            suffix = f"?next={quote(target, safe='')}" if target != "/dashboard" else ""
+            return RedirectResponse(url=f"/login{suffix}", status_code=303)
+        return JSONResponse(
+            {"detail": "Autenticação institucional necessária."},
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    def _render_login(
+        request: Request, *, next_url: str, error: str | None, http_status: int = 200
+    ) -> Response:
+        return templates.TemplateResponse(
+            request=request,
+            name="login.html",
+            context={
+                "next": next_url,
+                "error": error,
+                "environment": app_settings.environment,
+                "ad_enabled": app_settings.ad_login_enabled,
+                "govbr_url": _govbr_login_url(app_settings, next_url),
+            },
+            status_code=http_status,
+        )
+
+    @application.get("/login", include_in_schema=False)
+    async def login_page(request: Request, next: str = "/dashboard") -> Response:
+        target = _safe_next(next)
+        if app_settings.ad_login_enabled and _current_session(request) is not None:
+            return RedirectResponse(url=target, status_code=303)
+        return _render_login(request, next_url=target, error=None)
+
+    @application.post("/login", include_in_schema=False)
+    def login_submit(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+        next: str = Form("/dashboard"),
+    ) -> Response:
+        target = _safe_next(next)
+        if not app_settings.ad_login_enabled:
+            return _render_login(
+                request,
+                next_url=target,
+                error="Login institucional ainda não configurado nesta instância.",
+                http_status=503,
+            )
+        result = auth_ad.authenticate(
+            app_settings, username.strip(), password, origin=_client_ip(request)
+        )
+        if not result.ok:
+            return _render_login(
+                request,
+                next_url=target,
+                error=_friendly_login_error(result),
+                http_status=result.http_status or 401,
+            )
+        if not auth_ad.is_authorized(result.groups, app_settings.ad_allowed_groups):
+            return _render_login(
+                request,
+                next_url=target,
+                error="Seu usuário não tem permissão de acesso a este painel.",
+                http_status=403,
+            )
+        response = RedirectResponse(url=target, status_code=303)
+        _set_session_cookie(response, request, app_settings, result.token or "")
+        return response
+
+    @application.get("/logout", include_in_schema=False)
+    def logout(request: Request) -> Response:
+        token = request.cookies.get(app_settings.session_cookie_name)
+        if token and app_settings.ad_login_enabled:
+            auth_ad.logoff(app_settings, token)
+        response = RedirectResponse(url="/login", status_code=303)
+        response.delete_cookie(app_settings.session_cookie_name, path="/")
         return response
 
     @application.get("/", include_in_schema=False)
