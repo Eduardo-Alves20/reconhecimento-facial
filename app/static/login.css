@@ -88,19 +88,26 @@ body {
 
 .brand-gov strong { color: var(--texto); }
 
-.app-title {
-  text-align: center;
-  color: var(--azul);
-  font-size: 34px;
-  font-weight: 800;
-  letter-spacing: 0.04em;
-  margin: 8px 0 2px;
+.app-logo {
+  display: block;
+  width: 210px;
+  max-width: 70%;
+  height: auto;
+  margin: 10px auto 6px;
 }
 
 .app-subtitle {
   text-align: center;
-  color: var(--cinza);
+  color: var(--azul);
   font-size: 14px;
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+
+.app-access {
+  text-align: center;
+  color: var(--cinza);
+  font-size: 13px;
   margin: 0 0 22px;
 }
 

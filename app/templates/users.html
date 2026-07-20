@@ -4,19 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Usuários · RAG-Audit</title>
+  <title>Usuários · QTA</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/dashboard.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', path='/users.css') }}">
 </head>
 <body>
   <header class="app-header">
     <div class="app-header__inner">
-      <div class="brand" aria-label="RAG-Audit">
-        <span class="brand__mark" aria-hidden="true">RA</span>
-        <span>
-          <strong class="brand__name">RAG-Audit</strong>
-          <small class="brand__descriptor">Usuários do sistema</small>
+      <div class="brand" aria-label="QTA">
+        <span class="brand__logo">
+          <img src="{{ url_for('static', path='/qta-logo.jpg') }}" alt="QTA">
         </span>
+        <small class="brand__descriptor">Usuários do sistema</small>
       </div>
       <div class="header-status">
         <span class="environment-badge">{{ environment }}</span>

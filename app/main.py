@@ -152,7 +152,7 @@ def _basic_admin(request: Request, credentials: HTTPBasicCredentials | None) -> 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Autenticação administrativa necessária.",
-            headers={"WWW-Authenticate": 'Basic realm="RAG-Audit"'},
+            headers={"WWW-Authenticate": 'Basic realm="QTA"'},
         )
     return username
 
@@ -340,7 +340,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await evidence_task
 
     application = FastAPI(
-        title="RAG-Audit",
+        title="QTA",
         description=(
             "Auditoria contextual de acessos a salas críticas. "
             "A classificação não controla a fechadura nem substitui revisão humana."
@@ -593,7 +593,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> HTMLResponse:
         return get_swagger_ui_html(
             openapi_url="/openapi.json",
-            title="RAG-Audit · Documentação da API",
+            title="QTA · Documentação da API",
         )
 
     @application.post(

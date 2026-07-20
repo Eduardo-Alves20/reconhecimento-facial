@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>Acesso institucional · RAG-Audit</title>
+  <title>Acesso institucional · QTA</title>
   <link rel="stylesheet" href="{{ url_for('static', path='/login.css') }}">
   <script src="{{ url_for('static', path='/login.js') }}" defer></script>
 </head>
@@ -19,8 +19,10 @@
         </div>
       </header>
 
-      <h1 id="login-title" class="app-title">RAG-Audit</h1>
-      <p class="app-subtitle">Acesso institucional</p>
+      <img class="app-logo" src="{{ url_for('static', path='/qta-logo.jpg') }}"
+           alt="QTA — Quadro de Transparência Administrativa">
+      <p class="app-subtitle">Quadro de Transparência Administrativa</p>
+      <p class="app-access">Acesso institucional</p>
 
       {% if error %}
       <div class="alert" role="alert">{{ error }}</div>

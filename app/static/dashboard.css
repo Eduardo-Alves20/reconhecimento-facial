@@ -131,6 +131,20 @@ input:disabled {
   min-width: max-content;
 }
 
+.brand__logo {
+  display: inline-flex;
+  align-items: center;
+  background: #fff;
+  border-radius: 8px;
+  padding: 5px 10px;
+}
+
+.brand__logo img {
+  height: 26px;
+  width: auto;
+  display: block;
+}
+
 .brand__mark {
   display: grid;
   place-items: center;
